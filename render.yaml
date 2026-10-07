@@ -1,0 +1,67 @@
+services:
+  - type: web
+    name: shopify-validator
+    runtime: python
+    plan: starter                    # use "free" for testing (no disk, cold starts)
+    region: frankfurt                # pick the region closest to your users
+    branch: main
+    autoDeploy: true
+    healthCheckPath: /health
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+    startCommand: |
+      gunicorn api:app \
+        --worker-class uvicorn.workers.UvicornWorker \
+        --workers 1 \
+        --bind 0.0.0.0:$PORT \
+        --timeout 120 \
+        --graceful-timeout 30 \
+        --keep-alive 5 \
+        --log-level warning \
+        --access-logfile - \
+        --error-logfile -
+    envVars:
+      # ── Runtime ─────────────────────────────────────────────
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: PYTHONDONTWRITEBYTECODE
+        value: "1"
+
+      # ── API authentication ──────────────────────────────────
+      # MUST include every key your client (shopify_api.py) sends.
+      # Both SHOPIFY_API_KEY and ALT_API_KEY must be present here,
+      # otherwise the client's fallback key will get a 401.
+      - key: API_KEYS
+        value: DARKANONSHO!!!,AnonShopii2026!,shopifyprod,shopifyalt
+
+      # ── Validator tuning ────────────────────────────────────
+      - key: MAX_PRICE
+        value: "500.0"
+      - key: SITE_CONCURRENCY
+        value: "15"
+      - key: CACHE_TTL
+        value: "300"
+      - key: REQUEST_TIMEOUT
+        value: "35"
+      - key: CONNECT_TIMEOUT
+        value: "8"
+
+      # ── Logging ─────────────────────────────────────────────
+      - key: LOG_LEVEL
+        value: warning               # switch to "debug" while troubleshooting
+      - key: LOG_FILE
+        value: /var/data/requests.txt
+      - key: CARDS_FILE
+        value: /var/data/cards.txt
+
+    # ── Persistent disk ────────────────────────────────────────
+    # Keeps requests.txt + cards.txt across deploys and restarts.
+    # Requires a paid plan (Starter or higher). Remove this block
+    # if deploying on the free plan.
+    disk:
+      name: validator-data
+      mountPath: /var/data
+      sizeGB: 1
