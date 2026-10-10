@@ -72,7 +72,7 @@ VALID_API_KEYS = set(
     k.strip()
     for k in os.environ.get(
         "API_KEYS",
-        "DARKANONSHO!!!,shopifyprod,shopifyalt"
+        "oozaruhshop"
     ).split(",")
     if k.strip()
 )
