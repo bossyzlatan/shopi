@@ -567,17 +567,48 @@ def _parse_card(raw: str) -> Optional[dict]:
 
 
 def _parse_proxy(raw: Optional[str]) -> Optional[str]:
+    """
+    Accepts all of these and returns a single URL form the aiohttp/curl_cffi
+    session can consume:
+
+      http://user:pass@host:port       (already URL form)
+      https://host:port
+      socks5://host:port
+      user:pass@host:port              (URL form, no scheme)
+      host:port
+      user pass host port              (space-separated 4-field form)
+      host:port:user:pass              (colon-separated 4-field form)
+    """
     if not raw:
         return None
     s = raw.strip()
+    if not s:
+        return None
+
+    # Already has a scheme (http://, https://, socks5://, etc.)
     if "://" in s:
         return s
+
+    # URL form without a scheme:  user:pass@host:port
+    if "@" in s and ":" in s:
+        return f"http://{s}"
+
+    # Space-separated:  user pass host port   (4 fields)
+    parts_ws = s.split()
+    if len(parts_ws) == 4:
+        user, pwd, host, port = parts_ws
+        return f"http://{user}:{pwd}@{host}:{port}"
+
+    # Colon-separated
     parts = s.split(":")
     if len(parts) == 2:
+        # ip:port
         return f"http://{parts[0]}:{parts[1]}"
     if len(parts) == 4:
+        # ip:port:user:pass
         ip, port, user, password = parts
         return f"http://{user}:{password}@{ip}:{port}"
+
     return None
 
 
