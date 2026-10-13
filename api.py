@@ -765,7 +765,16 @@ async def _fetch_products(
     max_price: float = MAX_PRICE,
 ) -> tuple[Optional[dict], list[dict], Optional[str]]:
     """
-    Returns (best_product, all_candidates_under_max_price, error_string).
+    Returns (best_product, all_candidates, error_string).
+
+    Filtering behaviour:
+      1. Gather every in-stock variant on the site.
+      2. Prefer variants whose price is <= max_price.
+      3. If NO variant falls within the price range, fall back to the
+         single cheapest variant available on the site (even if it exceeds
+         max_price). This guarantees the caller always has a product to
+         work with as long as the store sells anything at all.
+
     Results are cached per hostname for CACHE_TTL seconds.
     """
     if not base_url.startswith("http"):
@@ -802,15 +811,19 @@ async def _fetch_products(
             except Exception:
                 continue
 
-        candidates: list[dict] = []
-        best: Optional[dict]   = None
-        best_price             = float("inf")
+        # ── Containers ──────────────────────────────────────────────────
+        candidates: list[dict] = []              # variants within price range
+        any_variant: list[dict] = []             # every in-stock variant, any price
+        best: Optional[dict] = None
+        best_price = float("inf")
+        cheapest_any: Optional[dict] = None
+        cheapest_any_price = float("inf")
 
         if not all_variants:
-            # Fallback for headless Shopify (e.g. Gymshark) where products.json is unavailable
+            # Fallback for headless Shopify where products.json is unavailable
             try:
                 import xml.etree.ElementTree as ET
-                import re
+                import re as _re
                 sitemap_url = f"{base_url}/sitemap_products_1.xml"
                 smap_resp = await session.get(sitemap_url, allow_redirects=True)
                 if smap_resp.status_code == 200:
@@ -827,19 +840,28 @@ async def _fetch_products(
                         for purl in sample_urls:
                             try:
                                 p_resp = await session.get(purl, allow_redirects=True)
-                                matches = re.finditer(r'"id":(\d+).*?"inStock":true.*?,"price":([\d.]+)', p_resp.text)
+                                matches = _re.finditer(
+                                    r'"id":(\d+).*?"inStock":true.*?,"price":([\d.]+)',
+                                    p_resp.text,
+                                )
                                 for m in matches:
                                     variant_id = m.group(1)
                                     price = float(m.group(2))
-                                    if 0 < price <= max_price:
-                                        entry = {
-                                            "site":       base_url,
-                                            "price":      f"{price:.2f}",
-                                            "price_f":    price,
-                                            "variant_id": str(variant_id),
-                                            "title":      "Product",
-                                            "handle":     "",
-                                        }
+                                    if price <= 0:
+                                        continue
+                                    entry = {
+                                        "site":       base_url,
+                                        "price":      f"{price:.2f}",
+                                        "price_f":    price,
+                                        "variant_id": str(variant_id),
+                                        "title":      "Product",
+                                        "handle":     "",
+                                    }
+                                    any_variant.append(entry)
+                                    if price < cheapest_any_price:
+                                        cheapest_any_price = price
+                                        cheapest_any       = entry
+                                    if price <= max_price:
                                         candidates.append(entry)
                                         if price < best_price:
                                             best_price = price
@@ -849,7 +871,7 @@ async def _fetch_products(
             except Exception:
                 pass
 
-            if not candidates:
+            if not any_variant:
                 err = "No products found"
                 _product_cache[hostname] = {"product": None, "candidates": [], "err": err, "ts": now}
                 return None, [], err
@@ -863,8 +885,9 @@ async def _fetch_products(
                         price = float(variant.get("price") or "0")
                     except (ValueError, TypeError):
                         continue
-                    if price <= 0 or price > max_price:
+                    if price <= 0:
                         continue
+
                     entry = {
                         "site":       base_url,
                         "price":      f"{price:.2f}",
@@ -873,17 +896,42 @@ async def _fetch_products(
                         "title":      product.get("title", "Product"),
                         "handle":     product.get("handle", ""),
                     }
-                    candidates.append(entry)
-                    if price < best_price:
-                        best_price = price
-                        best       = entry
+                    any_variant.append(entry)
+
+                    if price < cheapest_any_price:
+                        cheapest_any_price = price
+                        cheapest_any       = entry
+
+                    if price <= max_price:
+                        candidates.append(entry)
+                        if price < best_price:
+                            best_price = price
+                            best       = entry
+
+        # ── Fallback: cheapest product on site if none in range ──────────
+        fallback_used = False
+        if not candidates and cheapest_any is not None:
+            candidates = [cheapest_any]
+            best       = cheapest_any
+            best_price = cheapest_any_price
+            fallback_used = True
+            log.warning(
+                "[API] No variant under $%.2f on %s — falling back to cheapest ($%.2f)",
+                max_price, hostname, cheapest_any_price,
+            )
 
         if not best:
-            err = f"No products under ${max_price:.2f}"
+            err = f"No products under ${max_price:.2f} and no alternatives"
             _product_cache[hostname] = {"product": None, "candidates": [], "err": err, "ts": now}
             return None, [], err
 
-        _product_cache[hostname] = {"product": best, "candidates": candidates, "err": None, "ts": now}
+        _product_cache[hostname] = {
+            "product":    best,
+            "candidates": candidates,
+            "err":        None,
+            "ts":         now,
+            "fallback":   fallback_used,
+        }
         return best, candidates, None
 
     except (asyncio.TimeoutError, RequestsError):
