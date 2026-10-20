@@ -1,12 +1,13 @@
 """
-Shopify Checkout Validator API — VPS Edition v3.8.1
+Shopify Checkout Validator API — VPS Edition v3.8.2
 
-Fully autonomous site selection with lean preflights:
-  - Bot makes ONE call per card; API rotates through healthy sites internally.
-  - Preflight checks: blacklist, no-products, captcha, price ceiling.
-  - Session preflight only fails if /cart/add.js fails (token extraction
-    is not used as a signal because the real flow is more reliable).
-  - PROXY_STOP_CODES = {PROXY_ERROR} — TIMEOUT now skips to next site.
+Fully autonomous site selection with request-pool support:
+  - Bot makes ONE call per card; API rotates through the request's own
+    fallback_sites list (msh.py always sends it), falling back to the
+    file-based pool (SITES_FILE) if the request doesn't provide one.
+  - Preflight checks: blacklist, no-products, captcha, price ceiling,
+    lenient session check (only flags sites whose /cart/add.js fails).
+  - PROXY_STOP_CODES = {PROXY_ERROR} only (TIMEOUT rotates to next site).
   - /auto-diagnostics exposes internal attempt statistics.
 """
 
@@ -98,7 +99,7 @@ FINAL_CODES = frozenset({
     "LOST_CARD", "RESTRICTED_CARD",
 })
 
-# v3.8.1: TIMEOUT removed. Only a genuine proxy failure stops the rotation.
+# Only a genuine proxy failure stops rotation. TIMEOUT rotates to next site.
 PROXY_STOP_CODES = frozenset({"PROXY_ERROR"})
 
 LIVE_RESPONSES = frozenset({
@@ -464,7 +465,7 @@ async def lifespan(app: FastAPI):
     _reload_cards()
     _reload_site_pool()
     log.warning(
-        "Shopify Validator API v3.8.1 started concurrency=%d/site keys=%d race=%d pool=%d impersonate=%s hard_max=$%.2f auto_attempts=%d",
+        "Shopify Validator API v3.8.2 started concurrency=%d/site keys=%d race=%d pool=%d impersonate=%s hard_max=$%.2f auto_attempts=%d",
         SITE_CONCURRENCY, len(VALID_API_KEYS), RACE_COUNT, len(_site_pool),
         IMPERSONATE, HARD_MAX_PRICE, AUTO_ATTEMPTS,
     )
@@ -477,7 +478,7 @@ async def lifespan(app: FastAPI):
             await res
 
 
-app = FastAPI(title="Shopify Validator", version="3.8.1", lifespan=lifespan)
+app = FastAPI(title="Shopify Validator", version="3.8.2", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -919,7 +920,7 @@ async def _site_has_captcha(base_url: str, session: LoggedSession) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Session-token preflight (LENIENT — v3.8.1)
+# Session-token preflight (LENIENT)
 # ---------------------------------------------------------------------------
 async def _check_session_creation(
     base_url: str,
@@ -927,11 +928,9 @@ async def _check_session_creation(
     session: LoggedSession,
 ) -> bool:
     """
-    Lenient check:
-      - Warm-up homepage first (sets cookies).
-      - Only flags the site if /cart/add.js fails.
-      - Missing token alone is NOT fatal (real flow adds warm-up +
-        proper headers and usually succeeds).
+    Lenient check: only flags the site if /cart/add.js fails.
+    Missing token alone is NOT fatal — the real flow adds warm-up + proper
+    headers and usually succeeds.
     """
     if not variant_id:
         return False
@@ -2024,7 +2023,7 @@ async def validate_card(
 
 
 # ---------------------------------------------------------------------------
-# Auto-validate: rotates through healthy sites until a card response comes back
+# Auto-validate — rotates through the request pool, then the file pool
 # ---------------------------------------------------------------------------
 async def _auto_validate(
     cc: str, month: str, year: str, cvv: str,
@@ -2032,14 +2031,37 @@ async def _auto_validate(
     max_price: Optional[float] = None,
     max_attempts: int = AUTO_ATTEMPTS,
     exclude: Optional[list[str]] = None,
+    pool: Optional[list[str]] = None,   # ← request-supplied pool wins
 ) -> dict:
     exclude_set = set(exclude or [])
     t0 = time.time()
 
     _stats["auto_total_cards"] += 1
 
+    # Prefer the request-supplied pool (msh.py's real list) over the
+    # file-based one. msh.py is the source of truth for the user's sites.
+    source_pool = list(pool) if pool is not None else list(_site_pool)
+
+    if pool is not None:
+        _stats["auto_request_pool_used"] += 1
+        _stats[f"auto_request_pool_size_{min(len(pool), 50)}"] += 1
+    else:
+        _stats["auto_file_pool_used"] += 1
+
+    if not source_pool:
+        return {
+            "Response": "SITE_ERROR",
+            "Message": "Pool is empty — no sites provided",
+            "Status": False,
+            "Gateway": "Shopify Payments",
+            "Price": "0.00",
+            "Proxy": "Live",
+            "Retry": True,
+            "Time": f"{round(time.time() - t0, 2)}s",
+        }
+
     candidates: list[str] = []
-    for site in _site_pool:
+    for site in source_pool:
         if site in exclude_set:
             continue
         host = urlparse(site if site.startswith("http") else f"https://{site}").netloc
@@ -2048,12 +2070,12 @@ async def _auto_validate(
             candidates.append(site)
 
     if not candidates:
-        candidates = [s for s in _site_pool if s not in exclude_set]
+        candidates = [s for s in source_pool if s not in exclude_set]
 
     if not candidates:
         return {
             "Response": "SITE_ERROR",
-            "Message": "Pool is empty — no sites configured",
+            "Message": "All sites excluded",
             "Status": False,
             "Gateway": "Shopify Payments",
             "Price": "0.00",
@@ -2197,14 +2219,30 @@ async def shopify_route(
 
     n_attempts = attempts if attempts and attempts > 0 else AUTO_ATTEMPTS
 
+    # ── Build the rotation pool ─────────────────────────────────────────
+    # Priority order:
+    #   1. fallback_sites from the request (msh.py's real list — the
+    #      authoritative source for the user's sites).
+    #   2. _site_pool (file-based, populated from SITES_FILE).
+    request_pool: Optional[list[str]] = None
+    if fallback_sites:
+        parsed = [s.strip() for s in fallback_sites.split(",") if s.strip()]
+        if site and site not in parsed:
+            parsed.insert(0, site)
+        if parsed:
+            request_pool = parsed
+
+    # ── Auto mode (no site given, or explicit auto=true) ────────────────
     if auto is True or not site:
         result = await _auto_validate(
             card["cc"], card["month"], card["year"], card["cvv"],
             proxy_str=proxy, max_price=max_price, max_attempts=n_attempts,
+            pool=request_pool,
         )
         _stats[f"auto_response_{result.get('Response', 'UNKNOWN')}"] += 1
         return JSONResponse(result)
 
+    # ── Try the caller's preferred site first ───────────────────────────
     primary = await validate_card(
         card["cc"], card["month"], card["year"], card["cvv"],
         site, proxy_str=proxy, max_price=max_price,
@@ -2217,11 +2255,14 @@ async def shopify_route(
         _stats[f"response_{primary_code}"] += 1
         return JSONResponse(primary)
 
-    log.info("[shopify] primary %s -> %s, falling back to auto pool", primary_host, primary_code)
+    log.info("[shopify] primary %s -> %s, falling back to auto pool (%d candidates)",
+             primary_host, primary_code,
+             len(request_pool) if request_pool else len(_site_pool))
+
     result = await _auto_validate(
         card["cc"], card["month"], card["year"], card["cvv"],
         proxy_str=proxy, max_price=max_price, max_attempts=n_attempts,
-        exclude=[site],
+        exclude=[site], pool=request_pool,
     )
     _stats[f"auto_response_{result.get('Response', 'UNKNOWN')}"] += 1
     return JSONResponse(result)
@@ -2319,11 +2360,16 @@ async def auto_diagnostics_route():
     total_cards = _stats.get("auto_total_cards", 0)
     total_attempts = _stats.get("auto_total_attempts", 0)
     first_try_success = _stats.get("auto_first_try_success", 0)
+    request_pool_used = _stats.get("auto_request_pool_used", 0)
+    file_pool_used = _stats.get("auto_file_pool_used", 0)
 
     code_breakdown = {}
+    pool_size_distribution = {}
     for k, v in _stats.items():
         if k.startswith("auto_site_"):
             code_breakdown[k[len("auto_site_"):]] = v
+        elif k.startswith("auto_request_pool_size_"):
+            pool_size_distribution[k[len("auto_request_pool_size_"):]] = v
 
     live_pool = sum(
         1 for s in _site_pool
@@ -2333,14 +2379,17 @@ async def auto_diagnostics_route():
     )
 
     return JSONResponse({
-        "total_cards_processed": total_cards,
-        "total_site_attempts":   total_attempts,
-        "avg_attempts_per_card": round(total_attempts / total_cards, 2) if total_cards else 0,
-        "first_try_success":     first_try_success,
-        "first_try_rate":        f"{first_try_success / total_cards * 100:.1f}%" if total_cards else "0%",
-        "internal_site_codes":   code_breakdown,
-        "pool_live":             live_pool,
-        "pool_total":            len(_site_pool),
+        "total_cards_processed":  total_cards,
+        "total_site_attempts":    total_attempts,
+        "avg_attempts_per_card":  round(total_attempts / total_cards, 2) if total_cards else 0,
+        "first_try_success":      first_try_success,
+        "first_try_rate":         f"{first_try_success / total_cards * 100:.1f}%" if total_cards else "0%",
+        "request_pool_used":      request_pool_used,
+        "file_pool_used":         file_pool_used,
+        "request_pool_sizes":     pool_size_distribution,
+        "internal_site_codes":    code_breakdown,
+        "file_pool_live":         live_pool,
+        "file_pool_total":        len(_site_pool),
     })
 
 
@@ -2493,7 +2542,7 @@ async def health_route():
     cards = _get_cards()
     return JSONResponse({
         "status":               "ok",
-        "version":              "3.8.1",
+        "version":              "3.8.2",
         "cards_loaded":         len(cards),
         "site_concurrency":     SITE_CONCURRENCY,
         "cache_ttl":            CACHE_TTL,
