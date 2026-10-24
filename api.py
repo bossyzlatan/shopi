@@ -1,9 +1,8 @@
 """
-Shopify Checkout Validator API — Stateless v4.3.1
+Shopify Checkout Validator API — Stateless v4.3.2
 
-Config changes vs v4.3.0:
-  - SITE_CONCURRENCY: 15 → 25 (supports higher msh.py concurrency)
-  - REQUEST_TIMEOUT:  35 → 25 (faster failure on dead sites)
+v4.3.2:
+  - SITE_CONCURRENCY: 25 → 100 (matches 1000-card bot concurrency)
 """
 
 import asyncio
@@ -35,7 +34,7 @@ CARDS_FILE        = os.environ.get("CARDS_FILE", "cards.txt")
 MAX_PRICE         = float(os.environ.get("MAX_PRICE", 5.0))
 MIN_AMOUNT        = float(os.environ.get("MIN_AMOUNT", 0.50))
 HARD_MAX_PRICE    = float(os.environ.get("HARD_MAX_PRICE", 20.0))
-SITE_CONCURRENCY  = int(os.environ.get("SITE_CONCURRENCY", 25))       # was 15
+SITE_CONCURRENCY  = int(os.environ.get("SITE_CONCURRENCY", 100))   # was 25 — supports 1000-card bot concurrency
 AUTO_ATTEMPTS     = int(os.environ.get("AUTO_ATTEMPTS", 30))
 RACE_COUNT        = int(os.environ.get("RACE_COUNT", 3))
 BLACKLIST_THRESHOLD = float(os.environ.get("BLACKLIST_THRESHOLD", 0.92))
@@ -45,7 +44,7 @@ CACHE_TTL         = float(os.environ.get("CACHE_TTL", 300))
 VARIANT_TTL       = float(os.environ.get("VARIANT_TTL", 1800))
 FAIL_CACHE_TTL    = float(os.environ.get("FAIL_CACHE_TTL", 300))
 THROTTLE_COOLDOWN = int(os.environ.get("THROTTLE_COOLDOWN", 300))
-REQUEST_TIMEOUT   = float(os.environ.get("REQUEST_TIMEOUT", 25))      # was 35
+REQUEST_TIMEOUT   = float(os.environ.get("REQUEST_TIMEOUT", 25))
 LOG_LEVEL         = os.environ.get("LOG_LEVEL", "warning").upper()
 IMPERSONATE       = os.environ.get("IMPERSONATE", "chrome124")
 
@@ -1978,7 +1977,7 @@ async def validate_card_raced(
 # FASTAPI APP
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-app = FastAPI(title="Shopify Validator", version="4.3.1")
+app = FastAPI(title="Shopify Validator", version="4.3.2")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -2235,7 +2234,7 @@ async def health_route():
     now = time.time()
     return JSONResponse({
         "status":             "ok",
-        "version":            "4.3.1",
+        "version":            "4.3.2",
         "mode":               "stateless",
         "cards_loaded":       len(cards),
         "site_concurrency":   SITE_CONCURRENCY,
