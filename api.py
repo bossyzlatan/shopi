@@ -1,17 +1,9 @@
 """
-Shopify Checkout Validator API — Stateless v4.4.1
+Shopify Checkout Validator API — Stateless v4.3.1
 
-v4.4.1 changes:
-  - SITE_CONCURRENCY default: 15 → 8 (better fit for 1000-card concurrent bot)
-  - REQUEST_TIMEOUT default: 35 → 12 (real checkout is <3s; 12s catches dead sites)
-
-Full architecture unchanged from v4.4.0:
-  - Stateless. Client supplies fallback_sites per request.
-  - Single-attempt per call. msh.py owns retries.
-  - Structured response codes with SkipSite flag.
-  - Transient codes do not accumulate toward blacklist.
-  - _auto_validate runs transient retry pass before declaring exhaustion.
-  - SITES_EXHAUSTED is a distinct code from SITE_ERROR.
+Config changes vs v4.3.0:
+  - SITE_CONCURRENCY: 15 → 25 (supports higher msh.py concurrency)
+  - REQUEST_TIMEOUT:  35 → 25 (faster failure on dead sites)
 """
 
 import asyncio
@@ -43,19 +35,17 @@ CARDS_FILE        = os.environ.get("CARDS_FILE", "cards.txt")
 MAX_PRICE         = float(os.environ.get("MAX_PRICE", 5.0))
 MIN_AMOUNT        = float(os.environ.get("MIN_AMOUNT", 0.50))
 HARD_MAX_PRICE    = float(os.environ.get("HARD_MAX_PRICE", 20.0))
-SITE_CONCURRENCY  = int(os.environ.get("SITE_CONCURRENCY", 8))
+SITE_CONCURRENCY  = int(os.environ.get("SITE_CONCURRENCY", 25))       # was 15
 AUTO_ATTEMPTS     = int(os.environ.get("AUTO_ATTEMPTS", 30))
 RACE_COUNT        = int(os.environ.get("RACE_COUNT", 3))
-
 BLACKLIST_THRESHOLD = float(os.environ.get("BLACKLIST_THRESHOLD", 0.92))
 BLACKLIST_SAMPLES   = int(os.environ.get("BLACKLIST_SAMPLES", 15))
 BLACKLIST_SECONDS   = int(os.environ.get("BLACKLIST_SECONDS", 30))
-
 CACHE_TTL         = float(os.environ.get("CACHE_TTL", 300))
 VARIANT_TTL       = float(os.environ.get("VARIANT_TTL", 1800))
 FAIL_CACHE_TTL    = float(os.environ.get("FAIL_CACHE_TTL", 300))
 THROTTLE_COOLDOWN = int(os.environ.get("THROTTLE_COOLDOWN", 300))
-REQUEST_TIMEOUT   = float(os.environ.get("REQUEST_TIMEOUT", 12))
+REQUEST_TIMEOUT   = float(os.environ.get("REQUEST_TIMEOUT", 25))      # was 35
 LOG_LEVEL         = os.environ.get("LOG_LEVEL", "warning").upper()
 IMPERSONATE       = os.environ.get("IMPERSONATE", "chrome124")
 
@@ -1988,7 +1978,7 @@ async def validate_card_raced(
 # FASTAPI APP
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-app = FastAPI(title="Shopify Validator", version="4.4.1")
+app = FastAPI(title="Shopify Validator", version="4.3.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -2245,7 +2235,7 @@ async def health_route():
     now = time.time()
     return JSONResponse({
         "status":             "ok",
-        "version":            "4.4.1",
+        "version":            "4.3.1",
         "mode":               "stateless",
         "cards_loaded":       len(cards),
         "site_concurrency":   SITE_CONCURRENCY,
