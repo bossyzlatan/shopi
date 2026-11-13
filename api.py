@@ -5796,7 +5796,7 @@ _log = _logging.getLogger("api")
 
 API_KEY       = os.environ.get("MSH_API_KEY", "oozaruhshop").strip()
 WARMUP_SITE   = os.environ.get("WARMUP_SITE", eyelifter_DEFAULT_WARMUP_SITE).strip()
-CHECK_WORKERS = int(os.environ.get("CHECK_WORKERS", "200"))
+CHECK_WORKERS = int(os.environ.get("CHECK_WORKERS", "100"))
 QID_REFRESH   = int(os.environ.get("QID_REFRESH_SEC", "1800"))
 REQ_TIMEOUT   = int(os.environ.get("REQ_TIMEOUT_SEC", "90"))
 
