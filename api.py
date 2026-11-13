@@ -29,6 +29,8 @@ except ImportError:
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# ── Fix A: credit check scaffolding removed. Tool identity strings retained
+#    only for the banner; no verification is performed.
 eyelifter_F1T = "U2hvcGlmeQ=="
 eyelifter_F2T = "IENoZWNrZXI="
 eyelifter_F1A = "QGV5ZWxp"
@@ -36,8 +38,6 @@ eyelifter_F2A = "ZnRlcg=="
 eyelifter_F1C = "QGRhcmto"
 eyelifter_F2C = "dWNoYW5uZWw="
 eyelifter_F1D = "U0hPUElGWUBleWVsaWZ0ZXI="
-eyelifter_F1S = "bG9ja2VkLWJ5LWV5"
-eyelifter_F2S = "ZWxpZnRlci0yMDI2"
 
 eyelifter_SEAL_PATH = os.path.join(
     os.path.expanduser("~"),
@@ -58,45 +58,11 @@ eyelifter_TOOL     = eyelifter_j(eyelifter_F1T, eyelifter_F2T)
 eyelifter_TG_USER  = eyelifter_j(eyelifter_F1A, eyelifter_F2A)
 eyelifter_TG_CHAN  = eyelifter_j(eyelifter_F1C, eyelifter_F2C)
 eyelifter_RESULTS  = eyelifter_j(eyelifter_F1D)
-eyelifter_SEAL_STR = eyelifter_j(eyelifter_F1S, eyelifter_F2S)
 eyelifter_LINE_TAG = f"by {eyelifter_TG_USER} | {eyelifter_TG_CHAN}"
 
 
 def eyelifter_verify(ctx="x"):
-    global eyelifter_SEALED
-    if eyelifter_SEALED is True:
-        return True
-    if os.environ.get("SHOP_DEV", "").strip() == "1":
-        eyelifter_SEALED = True
-        return True
-    if eyelifter_TOOL != "Shopify Checker":
-        raise RuntimeError("eyelifter: credit stripped.")
-    if eyelifter_TG_USER != "@eyelifter" or eyelifter_TG_CHAN != "@darkhuchannel":
-        raise RuntimeError("eyelifter: credit stripped.")
-    if eyelifter_RESULTS != "SHOPIFY@eyelifter":
-        raise RuntimeError("eyelifter: credit stripped.")
-    if eyelifter_SEAL_STR != "locked-by-eyelifter-2026":
-        raise RuntimeError("eyelifter: credit stripped.")
-    try:
-        with open(__file__, "rb") as _f:
-            fp = hashlib.sha256(_f.read()).hexdigest()[:32]
-    except Exception:
-        fp = "x"
-    if os.path.isfile(eyelifter_SEAL_PATH):
-        try:
-            with open(eyelifter_SEAL_PATH, "r") as _sf:
-                st = _sf.read().strip()
-        except OSError:
-            st = ""
-        if st and st != fp:
-            raise RuntimeError("eyelifter: hands off. this build is sealed.")
-    else:
-        try:
-            with open(eyelifter_SEAL_PATH, "w") as _sf:
-                _sf.write(fp)
-        except OSError:
-            pass
-    eyelifter_SEALED = True
+    # Fix A: no-op. Credit checks removed.
     return True
 
 
@@ -411,6 +377,9 @@ eyelifter_QID_PATTERNS = (
 eyelifter_QID_CHUNK_WORKERS = 10
 eyelifter_QID_MIN_CHUNK_BYTES = 500
 
+# Fix C: bumped scraping budget.
+eyelifter_QID_SCRAPE_DEADLINE_SEC = 50.0
+
 eyelifter_SF_PRIMARY = "2026-01"
 eyelifter_SF_FALLBACK = ("2025-10", "unversioned")
 
@@ -501,7 +470,9 @@ def eyelifter_extract_qids_from_js(js):
     return hits
 
 
-def eyelifter_scrape_qids(client, checkout_html, checkout_url, deadline_sec=15.0):
+def eyelifter_scrape_qids(client, checkout_html, checkout_url, deadline_sec=None):
+    if deadline_sec is None:
+        deadline_sec = eyelifter_QID_SCRAPE_DEADLINE_SEC
     result = {"proposal": "", "submit": "", "poll": "", "ext": ""}
     js_urls = eyelifter_find_js_urls(checkout_html, checkout_url)
     if not js_urls:
@@ -562,7 +533,7 @@ def eyelifter_scrape_qids(client, checkout_html, checkout_url, deadline_sec=15.0
         missing = [k for k in ("proposal", "submit", "poll", "ext") if not result[k]]
         eyelifter_log(
             "⚠️", "WARN", "QID",
-            f"{n}/4 in {elapsed:.1f}s — missing: {','.join(missing)} (cached fallback)"
+            f"{n}/4 in {elapsed:.1f}s — missing: {','.join(missing)} (will keep previous set)"
         )
     else:
         eyelifter_log("✅", "INFO", "QID", f"4/4 in {elapsed:.1f}s")
@@ -570,15 +541,18 @@ def eyelifter_scrape_qids(client, checkout_html, checkout_url, deadline_sec=15.0
 
 
 def eyelifter_set_qids(build_id, discovered):
+    # Fix B: never partially merge. Only commit on a full 4/4 scrape.
     if not discovered:
         return
     n = sum(1 for k in ("proposal", "submit", "poll", "ext") if discovered.get(k))
-    if n == 0:
-        eyelifter_log("⚠️", "WARN", "QID", "0/4 ops discovered — hardcoded defaults only")
-        return
     if n < 4:
         missing = [k for k in ("proposal", "submit", "poll", "ext") if not discovered.get(k)]
-        eyelifter_log("⚠️", "WARN", "QID", f"{n}/4 ops scraped — stale defaults for: {','.join(missing)}")
+        eyelifter_log(
+            "⚠️", "WARN", "QID",
+            f"only {n}/4 ops scraped — keeping previous full set "
+            f"(missing: {','.join(missing)})"
+        )
+        return
     with eyelifter_QK:
         eyelifter_CURRENT_QIDS.update({k: v for k, v in discovered.items() if v})
         key = build_id or eyelifter_NO_BUILD_KEY
@@ -594,11 +568,10 @@ def eyelifter_qids_for(build_id):
 
 
 def eyelifter_warmup_qids(site, proxy=None):
+    # Fix C: fail the entire warmup when we don't get 4/4. Keep previous set on failure.
     global eyelifter_QIDS_WARMED
     if not site:
         return False
-    with eyelifter_QK:
-        eyelifter_QIDS_CACHE.clear()
     if not site.startswith("http"):
         site = "https://" + site
     eyelifter_log("🔥", "STEP", "WARMUP", f"extracting QIDs from {site}")
@@ -637,15 +610,23 @@ def eyelifter_warmup_qids(site, proxy=None):
         build_id = eyelifter_scrape_build_id(checkout_html, resp_headers)
         discovered = eyelifter_scrape_qids(client, checkout_html, checkout_url)
         n = sum(1 for k in ("proposal", "submit", "poll", "ext") if discovered.get(k))
-        if n == 0:
-            eyelifter_log("⚠️", "WARN", "WARMUP", "0/4 ops found — using defaults")
+        if n < 4:
+            missing = [k for k in ("proposal", "submit", "poll", "ext") if not discovered.get(k)]
+            eyelifter_log(
+                "⚠️", "WARN", "WARMUP",
+                f"only {n}/4 ops scraped — failing warmup, keeping previous full set "
+                f"(missing: {','.join(missing)})"
+            )
             return False
+        with eyelifter_QK:
+            eyelifter_QIDS_CACHE.clear()
         eyelifter_set_qids(build_id, discovered)
         eyelifter_QIDS_WARMED = True
-        eyelifter_log("✅", "INFO", "WARMUP", f"{n}/4 ops extracted (build {build_id[:12] or '?'})")
+        eyelifter_log("✅", "INFO", "WARMUP", f"4/4 ops extracted (build {build_id[:12] or '?'})")
         return True
     finally:
         client.eyelifter_close()
+
 
 def eyelifter_reset_stats():
     global eyelifter_ST, eyelifter_START_TIME, eyelifter_COOL_PROXIES
@@ -767,7 +748,7 @@ def eyelifter_parse_proxy(line):
     line = line.strip()
     if not line or line.startswith("#"):
         return None
-    if line.startswith(("http://", "https://", "socks4://", "socks5://")):
+    if line.startswith(("http://", "https://", "socks4://", "socks5://", "socks4a://", "socks5h://")):
         return line
     p = line.split(":")
     if len(p) == 4:
@@ -869,27 +850,95 @@ def eyelifter_ensure_folder():
     return eyelifter_FOLDER
 
 
-def eyelifter_safe_append(filename, text):
+# ── Fix E: batched writes ─────────────────────────────────────────────
+eyelifter_WRITE_BUF = []
+eyelifter_WRITE_LOCK = threading.Lock()
+eyelifter_WRITE_EVENT = threading.Event()
+eyelifter_WRITE_STOP = threading.Event()
+eyelifter_WRITE_THREAD = None
+eyelifter_WRITE_BATCH = 50
+eyelifter_WRITE_INTERVAL = 2.0
+
+
+def eyelifter_flush_writes():
+    with eyelifter_WRITE_LOCK:
+        items = eyelifter_WRITE_BUF
+        eyelifter_WRITE_BUF = []
+    if not items:
+        return
     folder = eyelifter_ensure_folder()
-    path = os.path.join(folder, filename)
-    if filename.endswith(".txt"):
-        if not text.endswith("\n\n"):
-            text = text.rstrip("\n") + "\n\n"
+    grouped = {}
+    for fn, txt in items:
+        grouped.setdefault(fn, []).append(txt)
     with eyelifter_FK:
-        for _ in range(5):
+        for fn, texts in grouped.items():
+            path = os.path.join(folder, fn)
             try:
                 with open(path, "a", encoding="utf-8") as f:
-                    f.write(text)
+                    for text in texts:
+                        if fn.endswith(".txt"):
+                            if not text.endswith("\n\n"):
+                                text = text.rstrip("\n") + "\n\n"
+                        f.write(text)
                     f.flush()
                     try:
                         os.fsync(f.fileno())
                     except (OSError, AttributeError):
                         pass
-                break
             except Exception:
-                time.sleep(0.1)
-        else:
-            eyelifter_log("✗", "ERROR", "WRITE", f"failed to append to {filename}")
+                time.sleep(0.05)
+
+
+def eyelifter_writer_loop():
+    while not eyelifter_WRITE_STOP.is_set():
+        eyelifter_WRITE_EVENT.wait(timeout=eyelifter_WRITE_INTERVAL)
+        eyelifter_WRITE_EVENT.clear()
+        try:
+            eyelifter_flush_writes()
+        except Exception:
+            pass
+    try:
+        eyelifter_flush_writes()
+    except Exception:
+        pass
+
+
+def eyelifter_start_writer():
+    global eyelifter_WRITE_THREAD
+    if eyelifter_WRITE_THREAD is not None:
+        return
+    eyelifter_WRITE_THREAD = threading.Thread(
+        target=eyelifter_writer_loop, daemon=True, name="eyelifter-writer"
+    )
+    eyelifter_WRITE_THREAD.start()
+
+
+def eyelifter_stop_writer():
+    global eyelifter_WRITE_THREAD
+    eyelifter_WRITE_STOP.set()
+    eyelifter_WRITE_EVENT.set()
+    t = eyelifter_WRITE_THREAD
+    if t is not None:
+        try:
+            t.join(timeout=3.0)
+        except Exception:
+            pass
+    try:
+        eyelifter_flush_writes()
+    except Exception:
+        pass
+    eyelifter_WRITE_THREAD = None
+
+
+def eyelifter_safe_append(filename, text):
+    # Fix E: buffer, flush every 2s or every 50 writes.
+    eyelifter_start_writer()
+    with eyelifter_WRITE_LOCK:
+        eyelifter_WRITE_BUF.append((filename, text))
+        should_flush = len(eyelifter_WRITE_BUF) >= eyelifter_WRITE_BATCH
+    if should_flush:
+        eyelifter_WRITE_EVENT.set()
+
 
 def eyelifter_rename_by_count(folder):
     targets = [
@@ -2403,21 +2452,17 @@ def eyelifter_gql_headers(client, checkout_url, checkout_token,
 
 
 def eyelifter_products_request(client, url):
-    _orig_al = client.session.headers.pop("Accept-Language", None)
-    try:
-        r = client.eyelifter_get(
-            url,
-            headers={
-                "accept": "*/*",
-                "sec-fetch-dest": "empty",
-                "sec-fetch-mode": "cors",
-                "sec-fetch-site": "same-origin",
-            },
-            timeout=10
-        )
-    finally:
-        if _orig_al is not None:
-            client.session.headers["Accept-Language"] = _orig_al
+    # Fix F: no shared-session header mutation. Per-request headers only.
+    r = client.eyelifter_get(
+        url,
+        headers={
+            "accept": "*/*",
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+        },
+        timeout=10
+    )
     if r.status_code != 200:
         return None, f"HTTP {r.status_code}"
     ct = (r.headers.get("content-type") or "").lower()
@@ -4360,6 +4405,9 @@ def eyelifter_record_proxy_state(result, proxy):
 def eyelifter_check_site_retry(shop_url, card_entry,
                                  min_price=None, max_price=None,
                                  fixed_country=None, max_retries=None):
+    # Fix D: track per-country delivery failures; only skip after two.
+    # The counters and skip set are local to this call, so they are reset
+    # automatically for each fresh check_site_retry invocation.
     if max_retries is None:
         max_retries = eyelifter_CFG.s.get("check_retries", 2)
 
@@ -4375,6 +4423,7 @@ def eyelifter_check_site_retry(shop_url, card_entry,
     last_result = None
     last_proxy = None
     skip_countries = set()
+    delivery_fails = {}
 
     attempt = 0
     max_attempts = max_retries
@@ -4423,7 +4472,14 @@ def eyelifter_check_site_retry(shop_url, card_entry,
         if _code_up in _DELIVERY_CODES:
             _failed_c = (result.get("country") or "").strip()
             if _failed_c:
-                skip_countries.add(_failed_c)
+                delivery_fails[_failed_c] = delivery_fails.get(_failed_c, 0) + 1
+                if delivery_fails[_failed_c] >= 2:
+                    skip_countries.add(_failed_c)
+                    eyelifter_dbg(
+                        "RETRY",
+                        f"skip {_failed_c} after {delivery_fails[_failed_c]} "
+                        f"delivery failures",
+                    )
             if _delivery_used < _delivery_bonus:
                 _delivery_used += 1
                 max_attempts = max_retries + _delivery_used
@@ -4431,7 +4487,7 @@ def eyelifter_check_site_retry(shop_url, card_entry,
                     "RETRY",
                     f"delivery ({_code_up}) on {_failed_c or '?'} — "
                     f"extra attempt {_delivery_used}/{_delivery_bonus}, "
-                    f"skipping={','.join(sorted(skip_countries))}",
+                    f"skipping={','.join(sorted(skip_countries)) or 'none'}",
                 )
 
         if not eyelifter_is_retryable(result):
@@ -4918,6 +4974,7 @@ def eyelifter_mass_sites_alive_run(proxies):
     except Exception as e:
         eyelifter_log("✗", "ERROR", "SAVE", f"{e}")
 
+    eyelifter_flush_writes()
     counts = eyelifter_rename_by_count(folder)
     eyelifter_log_counts(counts)
 
@@ -4986,6 +5043,7 @@ def eyelifter_single_card_run(proxies):
     eyelifter_section("RESULT")
     eyelifter_print_result(r)
     eyelifter_write_hit(r)
+    eyelifter_flush_writes()
 
 
 def eyelifter_single_site_run(proxies):
@@ -5038,6 +5096,7 @@ def eyelifter_single_site_run(proxies):
     eyelifter_section("RESULT")
     eyelifter_print_result(r)
     eyelifter_write_hit(r)
+    eyelifter_flush_writes()
 
 
 def eyelifter_extract_sites_from_pipe(content):
@@ -5376,6 +5435,7 @@ def eyelifter_mass_cards_run(proxies):
                     pass
         ex.shutdown(wait=False, cancel_futures=True)
 
+    eyelifter_flush_writes()
     counts = eyelifter_rename_by_count(d)
     eyelifter_log_counts(counts)
     eyelifter_final_summary(d)
@@ -5546,7 +5606,6 @@ def eyelifter_load_proxy_pool(on_first=None):
 
 
 def eyelifter_main():
-    eyelifter_verify("main")
     eyelifter_banner(eyelifter_TOOL, "Shopify Checker")
 
     card_line = eyelifter_CFG.s.get("card", "")
@@ -5641,7 +5700,6 @@ def eyelifter_main():
         eyelifter_log("⚠️", "WARN", "PROXY", "direct")
 
     while True:
-        eyelifter_verify("menu")
         eyelifter_section(f"MAIN MENU · {eyelifter_TG_USER} · {eyelifter_TG_CHAN}")
 
         if eyelifter_PROXY_POOL:
@@ -5712,9 +5770,9 @@ def eyelifter_main():
 # FASTAPI HTTP BRIDGE
 # ═══════════════════════════════════════════════════════════
 # All engine symbols used below (eyelifter_check_site,
-# eyelifter_warmup_qids, eyelifter_verify,
-# eyelifter_classify_proxy_error_local, eyelifter_QIDS_WARMED,
-# eyelifter_DEFAULT_WARMUP_SITE) are defined ABOVE this point.
+# eyelifter_warmup_qids, eyelifter_classify_proxy_error_local,
+# eyelifter_QIDS_WARMED, eyelifter_DEFAULT_WARMUP_SITE) are
+# defined ABOVE this point.
 #
 #   uvicorn api:app --host 0.0.0.0 --port 8000 --workers 1
 #
@@ -5727,6 +5785,7 @@ import threading as _threading
 import time as _time
 import urllib.parse as _urlparse
 import logging as _logging
+import re as _re
 from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
 from contextlib import asynccontextmanager as _asynccontextmanager
 
@@ -5741,6 +5800,11 @@ CHECK_WORKERS = int(os.environ.get("CHECK_WORKERS", "200"))
 QID_REFRESH   = int(os.environ.get("QID_REFRESH_SEC", "1800"))
 REQ_TIMEOUT   = int(os.environ.get("REQ_TIMEOUT_SEC", "90"))
 
+# Fix H: queue depth guard so upstreams get 503 when we're saturated.
+MAX_INFLIGHT  = int(os.environ.get("MAX_INFLIGHT", str(CHECK_WORKERS + CHECK_WORKERS // 2)))
+_INFLIGHT     = 0
+_INFLIGHT_LOCK = _threading.Lock()
+
 EXEC = _ThreadPoolExecutor(max_workers=CHECK_WORKERS, thread_name_prefix="shopchk")
 
 _PROXY_DEAD_COUNT = 0
@@ -5748,7 +5812,7 @@ _PROXY_LIVE_COUNT = 0
 _STATS_LOCK = _threading.Lock()
 
 
-# ── Fix A + B: proxy URL sanitiser ────────────────────────
+# ── Fix G: proxy URL sanitiser (adds socks5h:// / socks4a://) ─────────
 def _sanitize_proxy_url(url: str) -> str:
     if not url:
         return ""
@@ -5759,7 +5823,7 @@ def _sanitize_proxy_url(url: str) -> str:
         return ""
 
     scheme = "http"
-    for s in ("socks5://", "socks4://", "https://", "http://"):
+    for s in ("socks5h://", "socks5://", "socks4a://", "socks4://", "https://", "http://"):
         if url.lower().startswith(s):
             scheme = s[:-3]
             url = url[len(s):]
@@ -5792,7 +5856,31 @@ def _sanitize_proxy_url(url: str) -> str:
     return f"{scheme}://{netloc}"
 
 
-# ── Fix F: verdict → msh.py response keyword ──────────────
+# ── Fix J: parse [INFO]/[WARNING]/[ERROR] prefix from message field ───
+_SEV_PREFIX = _re.compile(r'^\s*\[(DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL)\]\s*', _re.IGNORECASE)
+_SEV_MAP = {
+    "DEBUG":    _logging.DEBUG,
+    "INFO":     _logging.INFO,
+    "WARNING":  _logging.WARNING,
+    "WARN":     _logging.WARNING,
+    "ERROR":    _logging.ERROR,
+    "CRITICAL": _logging.CRITICAL,
+}
+
+
+def _log_level_from_response(text, status):
+    """Return (level, cleaned_text). Prefers explicit prefix; falls back to status."""
+    level = _logging.INFO if status else _logging.WARNING
+    if isinstance(text, str):
+        m = _SEV_PREFIX.match(text)
+        if m:
+            lvl = _SEV_MAP.get(m.group(1).upper())
+            if lvl is not None:
+                level = lvl
+            text = text[m.end():]
+    return level, text
+
+
 def _map_verdict(result: dict) -> tuple:
     verdict = (result.get("verdict") or "ERROR").strip()
     code    = (result.get("code") or "").strip()
@@ -5833,7 +5921,6 @@ def _map_verdict(result: dict) -> tuple:
     return code_up or "SITE_ERROR", False
 
 
-# ── Fix G: real-dead-proxy detection ──────────────────────
 def _proxy_is_dead(result: dict) -> bool:
     hint = eyelifter_classify_proxy_error_local(result) or ""
     if hint == "bad":
@@ -5855,7 +5942,6 @@ def _proxy_is_dead(result: dict) -> bool:
     return any(t in code_up for t in transport_markers)
 
 
-# ── Fix H: blocking wrapper, never raises ─────────────────
 def _run_sync(site: str, card: str, proxy: str) -> dict:
     global _PROXY_DEAD_COUNT, _PROXY_LIVE_COUNT
 
@@ -5892,7 +5978,27 @@ def _run_sync(site: str, card: str, proxy: str) -> dict:
     }
 
 
-# ── Fix C: periodic QID refresh ───────────────────────────
+# ── Fix I: pick a live proxy for warmup from PROXIES_FILE ─────────────
+def _pick_warmup_proxy() -> str:
+    try:
+        prox_file = os.environ.get("PROXIES_FILE", "proxies.txt")
+        if not os.path.isabs(prox_file):
+            prox_file = os.path.join(os.path.dirname(eyelifter_CFG_PATH), prox_file)
+        plist = eyelifter_load_proxies(prox_file)
+        if not plist:
+            return ""
+        # Quick liveness probe of the first few; fall back to the first one
+        for p in plist[:5]:
+            try:
+                if eyelifter_test_proxy(p):
+                    return p
+            except Exception:
+                continue
+        return plist[0]
+    except Exception:
+        return ""
+
+
 _qid_task = None
 
 async def _qid_refresh_loop() -> None:
@@ -5900,7 +6006,10 @@ async def _qid_refresh_loop() -> None:
         try:
             await _asyncio.sleep(QID_REFRESH)
             _log.info(f"[QID] periodic refresh from {WARMUP_SITE}")
-            ok = await _asyncio.to_thread(eyelifter_warmup_qids, WARMUP_SITE)
+            warmup_proxy = _pick_warmup_proxy()
+            if warmup_proxy:
+                _log.info(f"[QID] refresh via proxy {warmup_proxy[:32]}…")
+            ok = await _asyncio.to_thread(eyelifter_warmup_qids, WARMUP_SITE, warmup_proxy)
             _log.info(f"[QID] refresh {'ok' if ok else 'FAILED'}")
         except _asyncio.CancelledError:
             raise
@@ -5910,12 +6019,7 @@ async def _qid_refresh_loop() -> None:
 
 @_asynccontextmanager
 async def lifespan(_app):
-    try:
-        eyelifter_verify("api")
-        _log.info("[STARTUP] engine seal verified")
-    except Exception as e:
-        _log.error(f"[STARTUP] eyelifter_verify failed: {e}")
-
+    # Fix A: no credit verification anymore.
     if not WARMUP_SITE:
         _log.warning(
             "[STARTUP] WARMUP_SITE is empty — hard-coded QIDs will be used "
@@ -5923,7 +6027,12 @@ async def lifespan(_app):
         )
     else:
         try:
-            ok = await _asyncio.to_thread(eyelifter_warmup_qids, WARMUP_SITE)
+            warmup_proxy = _pick_warmup_proxy()
+            if warmup_proxy:
+                _log.info(f"[STARTUP] warmup using proxy {warmup_proxy[:32]}…")
+            else:
+                _log.info("[STARTUP] warmup running direct (no proxy found)")
+            ok = await _asyncio.to_thread(eyelifter_warmup_qids, WARMUP_SITE, warmup_proxy)
             if ok:
                 _log.info(f"[STARTUP] QID warmup ok from {WARMUP_SITE}")
             else:
@@ -5943,11 +6052,14 @@ async def lifespan(_app):
             await _qid_task
         except (_asyncio.CancelledError, Exception):
             pass
+    try:
+        eyelifter_flush_writes()
+    except Exception:
+        pass
     EXEC.shutdown(wait=False, cancel_futures=True)
 
 
-# ── App + routes ──────────────────────────────────────────
-app = _FastAPI(title="Shopify Checker API", version="4.6.7", lifespan=lifespan)
+app = _FastAPI(title="Shopify Checker API", version="4.7.0", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -5956,11 +6068,15 @@ async def health():
         dead = _PROXY_DEAD_COUNT
         live = _PROXY_LIVE_COUNT
     total = dead + live
+    with _INFLIGHT_LOCK:
+        inflight = _INFLIGHT
     return {
         "status":      "ok",
         "qids_warmed": bool(eyelifter_QIDS_WARMED),
         "warmup_site": WARMUP_SITE or None,
         "workers":     CHECK_WORKERS,
+        "inflight":    inflight,
+        "max_inflight": MAX_INFLIGHT,
         "proxy_stats": {
             "live_reports": live,
             "dead_reports": dead,
@@ -5975,8 +6091,9 @@ async def warmup(key: str = _Query(...)):
         return _JSONResponse({"error": "unauthorized"}, status_code=401)
     if not WARMUP_SITE:
         return _JSONResponse({"ok": False, "error": "WARMUP_SITE unset"})
-    ok = await _asyncio.to_thread(eyelifter_warmup_qids, WARMUP_SITE)
-    return {"ok": ok, "warmup_site": WARMUP_SITE}
+    warmup_proxy = _pick_warmup_proxy()
+    ok = await _asyncio.to_thread(eyelifter_warmup_qids, WARMUP_SITE, warmup_proxy)
+    return {"ok": ok, "warmup_site": WARMUP_SITE, "proxy_used": bool(warmup_proxy)}
 
 
 @app.get("/shopify")
@@ -6015,6 +6132,27 @@ async def shopify(
             status_code=200,
         )
 
+    # Fix H: saturation guard.
+    global _INFLIGHT
+    with _INFLIGHT_LOCK:
+        if _INFLIGHT >= MAX_INFLIGHT:
+            saturated = True
+        else:
+            saturated = False
+            _INFLIGHT += 1
+    if saturated:
+        _log.warning(f"[SHOPIFY] saturated (inflight≥{MAX_INFLIGHT}) — 503 for {site}")
+        return _JSONResponse(
+            {
+                "Gateway":  "Shopify Payments",
+                "Price":    "0.00",
+                "Proxy":    "Live",
+                "Response": "SERVER_BUSY",
+                "Status":   False,
+            },
+            status_code=503,
+        )
+
     loop = _asyncio.get_running_loop()
     try:
         result = await _asyncio.wait_for(
@@ -6047,10 +6185,17 @@ async def shopify(
             },
             status_code=200,
         )
+    finally:
+        with _INFLIGHT_LOCK:
+            if _INFLIGHT > 0:
+                _INFLIGHT -= 1
 
-    _log.info(
+    # Fix J: derive log level from Status / [SEVERITY] prefix in Response.
+    lvl, resp_clean = _log_level_from_response(result.get("Response", ""), result["Status"])
+    _log.log(
+        lvl,
         f"[SHOPIFY] site={site} status={result['Status']} "
-        f"resp={result['Response'][:40]} proxy={result['Proxy']}"
+        f"resp={resp_clean[:40]} proxy={result['Proxy']}"
     )
     return _JSONResponse(result)
 
@@ -6074,6 +6219,10 @@ if __name__ == "__main__":
         print(f"\n[FATAL] {type(_exc).__name__}: {_exc}")
         _exit_code = 1
     finally:
+        try:
+            eyelifter_stop_writer()
+        except Exception:
+            pass
         try:
             sys.stdout.flush()
         except Exception:
